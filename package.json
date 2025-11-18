@@ -1,0 +1,29 @@
+{
+  "name": "forex-signal-telegram-bot",
+  "version": "1.0.0",
+  "description": "TwelveData API-dan foydalanuvchi forex signal Telegram boti",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "forex",
+    "signal",
+    "telegram",
+    "bot",
+    "savdo",
+    "twelvedata"
+  ],
+  "author": "Savdo Bot",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.12.2",
+    "axios": "^1.4.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
