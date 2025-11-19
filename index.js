@@ -13,6 +13,7 @@ const RISK_REWARD = 2;
 const RSI_PERIOD = 14;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const express = require('express');
 
 async function fetchTimeSeries(symbol, interval) {
   const response = await axios.get('https://api.twelvedata.com/time_series', {
@@ -226,8 +227,30 @@ bot.start((ctx) => {
 
 bot.action('sniper_15m', handleSniperSignal);
 
-bot.launch();
-console.log('Smart Risk Assistant boti XAU/USD 15m uchun ishga tushirildi...');
+// Check if running on Render or locally
+if (process.env.RENDER_EXTERNAL_URL) {
+  // Running on Render - use webhook
+  const app = express();
+  const port = process.env.PORT || 3000;
+
+  // Health check route for Render
+  app.get('/', (req, res) => {
+    res.send('Smart Risk Assistant bot is running!');
+  });
+
+  // Set up webhook for Telegram
+  app.use(bot.webhookCallback(`/bot${process.env.BOT_TOKEN}`));
+
+  app.listen(port, () => {
+    console.log(`Smart Risk Assistant boti ${port}-portda ishga tushirildi...`);
+    // Set webhook URL when deployed on Render
+    bot.telegram.setWebhook(`https://${process.env.RENDER_EXTERNAL_URL}/bot${process.env.BOT_TOKEN}`);
+  });
+} else {
+  // Running locally - use polling
+  bot.launch();
+  console.log('Smart Risk Assistant boti polling rejimida ishga tushirildi...');
+}
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
