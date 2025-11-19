@@ -1,141 +1,74 @@
-# Forex Signal Telegram Boti
+# Forex Signal Telegram Bot - Multi-Timeframe Edition
 
-Node.js, Telegraf va TwelveData API-dan foydalanuvchi XAUUSD savdo signallarini beruvchi Forex signal Telegram boti.
+This is an advanced Forex Signal Telegram Bot that supports multiple timeframes and uses various technical indicators to generate trading signals for XAU/USD (Gold).
 
-## Xususiyatlar
+## Features
+- **Multi-timeframe support**: 3min, 15min, 1h, and 1day timeframes
+- **Technical indicators**: RSI(14), EMA20, EMA50, EMA200
+- **Candlestick pattern detection**: Bullish and Bearish Engulfing patterns
+- **Timeframe-specific strategies**: Each timeframe uses a tailored trading strategy
+- **Probability calculation**: Signals come with probability estimates
+- **Formatted output**: Professional signal format for Telegram
 
-- XAU/USD (Oltin) uchun SOTIB OLISH/SOTISH/NEYTRAL signallarini taqdim etadi
-- RSI(14) va EMA(200) ko'rsatkichlaridan foydalanadi
-- Toza va formatlangan signal chiqishi
-- XAU/USD tugmasi bilan maxsus klaviatura (XAUUSD 🟡 OLTIN sifatida ko'rsatiladi)
+## Setup
+1. Install dependencies: `npm install`
+2. Create a `.env` file with:
+   ```
+   BOT_TOKEN=your_telegram_bot_token
+   TWELVEDATA_KEY=your_twelvedata_api_key  # or your preferred API
+   PORT=3000  # Optional, defaults to 3000
+   ```
+3. Start the bot: `npm start`
 
-## Talablalar
+## Timeframe Strategies
 
-- Node.js (v14 yoki undan yuqori versiya)
-- npm (v6 yoki undan yuqori versiya)
-- Telegram Bot Token
-- TwelveData API Kaliti (bepul tarif)
+### 3 Minute Scalping Strategy
+- Uses extremely fast conditions
+- EMA20 > EMA50 for bullish momentum
+- RSI < 25 for BUY zone, RSI > 75 for SELL zone
+- Requires engulfing candle pattern
+- Price must be above EMA20 for BUY, below for SELL
+- Probability: 80-90% (4/4 conditions), 60-75% (3/4 conditions), else NEUTRAL
 
-## O'rnatish
+### 15 Minute Advanced Scalping Strategy
+- BUY: EMA50 > EMA200, EMA20 > EMA50, RSI < 30, Bullish engulfing, Price above EMA20
+- SELL: EMA50 < EMA200, EMA20 < EMA50, RSI > 70, Bearish engulfing, Price below EMA20
+- Probability: 85-95% (5/5 conditions), 70-85% (4/5 conditions), 50-70% (3/5 conditions), else NEUTRAL
 
-1. Bu repositoryni kompyuteringizga klon qiling yoki yuklab oling
-2. Terminalda loyihaning papkasiga kiring
-3. Quyidagi buyruq bilan kerakli modullarni o'rnating:
+### 1 Hour Swing Trading Strategy
+- BUY: EMA20 crossing above EMA50, EMA50 > EMA200, RSI 40-55, Bullish pattern
+- SELL: EMA20 crossing below EMA50, EMA50 < EMA200, RSI 45-60, Bearish pattern
+- Probability: 80-90% (4/4 conditions), 60-75% (3/4 conditions), else NEUTRAL
 
-```bash
-npm install
+### 1 Day Long-term Strategy
+- BUY: EMA50 > EMA200 (macro uptrend), RSI < 40, Bullish engulfing, Price above EMA50
+- SELL: EMA50 < EMA200, RSI > 60, Bearish engulfing, Price below EMA50
+- Probability: 85-95% (4/4 conditions), 60-80% (3/4 conditions), else NEUTRAL
+
+## Usage
+- Start the bot with `/start` command
+- Select XAUUSD symbol using the inline keyboard
+- Choose from available timeframes: 3min, 15min, 1h, or 1day
+- The bot will analyze the market based on the selected timeframe and provide a detailed signal
+
+## Signal Output Format
+```
+📊 XAU/USD Signal (timeframe)
+💰 Price: [price]
+📈 RSI14: [rsi_value]
+📉 EMA20: [ema20_value]
+📉 EMA50: [ema50_value]
+📉 EMA200: [ema200_value]
+🕯 Pattern Detected: [pattern_type]
+📌 Trend direction: [trend]
+🎯 Final SIGNAL: [BUY/SELL/NEUTRAL]
+🔮 Probability: [probability_percentage]
+💡 Reason: [conditions_met]/[total_conditions] conditions met ([reason_list])
 ```
 
-4. Ilovaga kirish uchun `.env` faylini ildiz papkada yarating va ma'lumotlaringizni kiriting:
-
-```env
-BOT_TOKEN=telegram_bot_tokeni_sizniki
-TWELVEDATA_KEY=twelvedata_api_kalitingiz
-```
-
-## Kerakli Kalitlarni Olish
-
-### Telegram Bot Token
-1. Telegram-ni oching va `@BotFather` qidiring
-2. Suhbat boshlang va `/newbot` buyrug'ini ishlating
-3. Bot yaratish bo'yicha ko'rsatmalarga amal qiling
-4. BotFather tomonidan berilgan token-ni ko'chiring
-
-### TwelveData API Kaliti
-1. https://twelvedata.com/ manziliga o'ting
-2. Bepul hisob yarating
-3. Panel bo'limidan API kalitingizni oling
-
-## Foydalanish
-
-1. Botni ishga tushiring:
-
-```bash
-npm start
-```
-
-2. Telegram-ni oching va botni toping
-3. Botni ishga tushirish uchun `/start` yuboring
-4. Savdo signallarini olish uchun "XAUUSD 🟡 OLTIN" tugmasini bosing
-
-## Savdo Strategiyasi
-
-Bot endi quyidagi mantiq bilan ishlovchi kengaytirilgan 3X tasdiqlash strategiyasidan foydalanadi:
-
-### SOTIB OLISH SHARTLARI (Barcha 4 ta shart bajarilishi kerak):
-- **O'suvchi Trend**: EMA50 > EMA200
-- **RSI Sotuvga Qiyson**: RSI < 35 (o'suvchi trendda)
-- **Shovqinli Qamrov Patterni**: Oxirgi 2 shamda aniqlangan
-- **EMA50 Dan Yuqori Narx**: Joriy narx EMA50 dan yuqorida (oqim davomi)
-
-Barcha shartlar bajarilsa:
-**Signal** = SOTIB OLISH
-**Ehtimollik** = 90–95%
-**Sabab**: 4/4 shartlar bajarildi
-
-### SOTISH SHARTLARI (Barcha 4 ta shart bajarilishi kerak):
-- **Tushuvchi Trend**: EMA50 < EMA200
-- **RSI Sotuvga Qiyson**: RSI > 65 (tushuvchi trendda)
-- **To'qimli Qamrov Patterni**: Oxirgi 2 shamda aniqlangan
-- **EMA50 Dan Past Narx**: Joriy narx EMA50 dan pastda (oqim davomi)
-
-Barcha shartlar bajarilsa:
-**Signal** = SOTISH
-**Ehtimollik** = 90–95%
-**Sabab**: 4/4 shartlar bajarildi
-
-### EHTIMOLLIK HISOBLASH
-Qanoatlantirilgan shartlar soni asosida:
-- **4/4**: 90–95% (Kuchli signal)
-- **3/4**: 75–85% (Yaxshi signal)
-- **2/4**: 55–65% (O'rtacha signal)
-- **1/4**: 20–40% (Slab signal)
-- **0/4**: 0–40% (Neytral)
-
-### SHAM PATTERNI MANTIG'I
-- **Shovqinli Qamrov**: Oldingi qizil shamni joriy yashil sham to'liq qamrab oladi
-- **To'qimli Qamrov**: Oldingi yashil shamni joriy qizil sham to'liq qamrab oladi
-
-## API Javob Formatlari
-
-Bot API javoblarni tushunishga yordam beruvchi so'rovlarni kiritadi. Bot ishga tushirilganda, API javob strukturasi ko'rsatiladi, bu API xatolarini hal etishga yordam beradi.
-
-## Namuna Chiqish
-
-XAUUSD tugmasini bosganda, bot quyidagicha javob qaytaradi:
-
-```
-📊 *XAU/USD Kengaytirilgan Savdo Signali*
-
-💰 *Narx:* $2025.60
-📊 *RSI (14):* 32.45
-📊 *EMA (50):* $2018.30
-📊 *EMA (200):* $1995.20
-📈 *Sham Patterni:* ✅ HA
-O'suvchi Trend
-🎯 *Signal:* SOTIB OLISH
-🔮 *Ehtimollik:* 82%
-
-💡 *Sabablar:*
-  • 3/4 shart bajarildi
-  • O'suvchi Trend (EMA50 > EMA200), RSI Sotuvga Qiyson, Shovqinli Qamrov Patterni
-
-*Eslatma: Bular faqat axborot maqsadida. Har doim o'zingiz savdo qilishdan oldin o'zingiz tekshiruv qiling.*
-```
-
-## Fayl Strukturasi
-
-```
-├── index.js          # Asosiy bot mantiqi
-├── package.json      # Loyiha modullari va konfiguratsiyasi
-├── .env             # O'zgaruvchilar (repo-ga kirmaydi)
-└── README.md        # Ushbu fayl
-```
-
-## Muport Sizlik Eslatmasi
-
-Ushbu bot faqat o'quvchilik va axborot maqsadlarida. Savdoda katta xavf bor va hech qachon o'zgaruvchi pulingizni yo'qotishga tayyor bo'lmasangiz sarmoya sifatida kirmeng. Hech qanday savdo qilishdan oldin doim o'zingiz tekshiruv qiling.
-
-## Litsenziya
-
-MIT
+## Implementation Details
+- Modular strategy functions for each timeframe
+- Dispatcher function to apply correct strategy based on timeframe
+- Candle pattern detector for engulfing patterns
+- Probability calculator for each strategy
+- Message formatter for consistent Telegram output
