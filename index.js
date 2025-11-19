@@ -244,7 +244,30 @@ if (process.env.RENDER_EXTERNAL_URL) {
   app.listen(port, () => {
     console.log(`Smart Risk Assistant boti ${port}-portda ishga tushirildi...`);
     // Set webhook URL when deployed on Render
-    bot.telegram.setWebhook(`https://${process.env.RENDER_EXTERNAL_URL}/bot${process.env.BOT_TOKEN}`);
+    // Check if RENDER_EXTERNAL_URL already includes the protocol
+    let renderUrl = process.env.RENDER_EXTERNAL_URL;
+    console.log("RENDER_EXTERNAL_URL:", process.env.RENDER_EXTERNAL_URL); // Debug log
+
+    if (renderUrl) {
+      // Remove protocol if it's already there to avoid double https://
+      if (renderUrl.startsWith('https://')) {
+        renderUrl = renderUrl.substring(8); // Remove 'https://'
+      } else if (renderUrl.startsWith('http://')) {
+        renderUrl = renderUrl.substring(7); // Remove 'http://'
+      }
+
+      // Add https:// to make it a proper URL
+      renderUrl = `https://${renderUrl}`;
+    } else {
+      // Fallback in case RENDER_EXTERNAL_URL is not set (shouldn't happen on Render)
+      console.error("RENDER_EXTERNAL_URL is not set!");
+      return;
+    }
+
+    const webhookUrl = `${renderUrl}/bot${process.env.BOT_TOKEN}`;
+    console.log("Setting webhook to:", webhookUrl); // Debug log
+
+    bot.telegram.setWebhook(webhookUrl);
   });
 } else {
   // Running locally - use polling
