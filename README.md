@@ -2,6 +2,8 @@
 
 This is an advanced Forex Signal Telegram Bot that supports multiple timeframes and uses various technical indicators to generate trading signals for XAU/USD (Gold).
 
+python -m uvicorn smc_server:app --host 0.0.0.0 --port 8000
+
 ## Features
 - **Multi-timeframe support**: 3min, 15min, 1h, and 1day timeframes
 - **Technical indicators**: RSI(14), EMA20, EMA50, EMA200

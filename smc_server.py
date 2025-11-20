@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -29,17 +29,19 @@ app = FastAPI(title="SMC + AI Trading Signal API", version="1.0.0")
 smc_engine = SMCEngine()
 
 class SignalPayload(BaseModel):
-    open: List[float] = Field(..., min_items=10, description="Open prices")
-    high: List[float] = Field(..., min_items=10, description="High prices")
-    low: List[float] = Field(..., min_items=10, description="Low prices")
-    close: List[float] = Field(..., min_items=10, description="Close prices")
+    open: List[float] = Field(..., description="Open prices")
+    high: List[float] = Field(..., description="High prices")
+    low: List[float] = Field(..., description="Low prices")
+    close: List[float] = Field(..., description="Close prices")
 
 class PredictPayload(BaseModel):
-    closes: List[float] = Field(..., min_items=20, description="Chronological close prices")
+    closes: List[float] = Field(..., description="Chronological close prices")
     normalize: bool = Field(default=True, description="Whether to normalize inputs before inference")
 
     @validator('closes')
     def validate_closes(cls, v):
+        if len(v) < 20:
+            raise ValueError("Need at least 20 close prices for prediction")
         if any(not np.isfinite(price) for price in v):
             raise ValueError("All close prices must be finite numbers")
         return v
@@ -52,9 +54,9 @@ class SMCResponse(BaseModel):
     orderBlocks: List[Dict[str, Any]]
     liquiditySwept: bool
     bias: str
-    entry: float = None
-    sl: float = None
-    tp: float = None
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
     explanation: str
 
 class PredictResponse(BaseModel):
@@ -67,15 +69,19 @@ class FinalSignalResponse(BaseModel):
     confidence: float
     smc_analysis: SMCResponse
     ai_prediction: PredictResponse
-    entry: float = None
-    sl: float = None
-    tp: float = None
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
     explanation: str
 
 def map_signal(prediction: float) -> str:
-    if prediction > 0.6:
+    """
+    Map prediction to trading signal with more sensitive thresholds
+    Model outputs are typically small values, so we use lower thresholds
+    """
+    if prediction > 0.1:  # Changed from 0.6 to 0.1 for better sensitivity
         return 'BUY'
-    if prediction < -0.6:
+    if prediction < -0.1:  # Changed from -0.6 to -0.1
         return 'SELL'
     return 'NEUTRAL'
 
@@ -88,6 +94,28 @@ def normalize_series(closes: List[float]) -> tuple:
     std = float(series.std()) or 1.0
     normalized = (series - mean) / std
     return normalized, mean, std
+
+def calculate_confidence(prediction: float) -> float:
+    """
+    Calculate confidence score from raw prediction
+    Since model outputs are small, we scale them appropriately
+    """
+    # Scale the prediction to a 0-1 confidence range
+    # Predictions typically range from -1 to 1, but in practice are much smaller
+    # We use a sigmoid-like scaling for better representation
+    abs_pred = abs(prediction)
+    
+    # If prediction is very small (< 0.01), confidence is low
+    if abs_pred < 0.01:
+        confidence = abs_pred * 10  # Scale up small values
+    # If prediction is moderate (0.01 - 0.5), use linear scaling
+    elif abs_pred < 0.5:
+        confidence = 0.1 + (abs_pred - 0.01) * 1.5  # Linear interpolation
+    # If prediction is large (> 0.5), high confidence
+    else:
+        confidence = min(1.0, 0.5 + abs_pred)
+    
+    return float(min(1.0, max(0.0, confidence)))
 
 def reshape_for_lstm(series: np.ndarray) -> np.ndarray:
     if series.ndim != 1:
@@ -146,7 +174,7 @@ async def predict(payload: PredictPayload):
             raise HTTPException(status_code=400, detail=f"Failed to run inference: {str(exc)}")
 
     signal = map_signal(prediction)
-    confidence = float(min(1.0, abs(prediction)))
+    confidence = calculate_confidence(prediction)  # Use new confidence calculation
     return PredictResponse(signal=signal, confidence=confidence, raw_prediction=prediction)
 
 @app.post('/final', response_model=FinalSignalResponse)

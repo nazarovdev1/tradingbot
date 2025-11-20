@@ -1,0 +1,24 @@
+{
+  "initial_value": 10000.0,
+  "final_value": 10000.0,
+  "total_return": 0.0,
+  "sharpe_ratio": 0,
+  "max_drawdown": 0.0,
+  "total_trades": 0,
+  "winning_trades": 0,
+  "losing_trades": 0,
+  "win_rate": 0,
+  "profit_factor": 0,
+  "pnl": 0.0,
+  "trades_list": [],
+  "strategy_params": {
+    "printlog": false,
+    "risk_per_trade": 0.02,
+    "max_risk_allowed": 40,
+    "atr_period": 14,
+    "ema200_period": 200,
+    "ema50_period": 50,
+    "rsi_period": 14,
+    "risk_reward": 2.0
+  }
+}
