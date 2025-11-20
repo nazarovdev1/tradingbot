@@ -4,13 +4,18 @@ const axios = require('axios');
 
 const SYMBOL = 'XAU/USD';
 const INTERVAL = '15min';
-const CANDLE_COUNT = 320; // enough bars to cover EMA200/ATR calculations
+const CANDLE_COUNT = 320; // enough bars to cover SMC calculations
 const MAX_RISK_ALLOWED = 40;
-const ATR_PERIOD = 14;
-const ATR_BASELINE_LOOKBACK = 10;
 const SWING_LOOKBACK = 10;
 const RISK_REWARD = 2;
-const RSI_PERIOD = 14;
+const AUTO_CHECK_INTERVAL_MS = parseInt(process.env.AUTO_CHECK_INTERVAL_MS || '60000', 10);
+const SMC_SERVER_URL = process.env.SMC_SERVER_URL || 'http://127.0.0.1:8000/final';
+const SMC_TIMEOUT_MS = parseInt(process.env.SMC_TIMEOUT_MS || '10000', 10);
+
+const subscribers = new Set();
+let autoMonitorIntervalId = null;
+let autoLoopRunning = false;
+let lastAutoSignal = null;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const express = require('express');
@@ -29,8 +34,8 @@ async function fetchTimeSeries(symbol, interval) {
     throw new Error(response.data?.message || 'Failed to fetch time series');
   }
 
-  if (!Array.isArray(response.data.values) || response.data.values.length < 210) {
-    throw new Error('Not enough data to compute indicators');
+  if (!Array.isArray(response.data.values) || response.data.values.length < 50) { // Reduced min for SMC
+    throw new Error('Not enough data to compute SMC indicators');
   }
 
   // TwelveData returns newest first; reverse for chronological calculations
@@ -45,159 +50,120 @@ async function fetchTimeSeries(symbol, interval) {
     .reverse();
 }
 
-function computeEMA(values, period) {
-  if (values.length < period) throw new Error(`Need at least ${period} values for EMA`);
-  const multiplier = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
-  for (let i = period; i < values.length; i++) {
-    ema = (values[i] - ema) * multiplier + ema;
+async function fetchSMCSignal(candles) {
+  if (!SMC_SERVER_URL) {
+    return {
+      signal: 'NEUTRAL',
+      confidence: 0,
+      error: 'SMC server URL missing',
+      bias: 'NEUTRAL',
+      explanation: 'SMC server not configured'
+    };
   }
-  return ema;
-}
 
-function computeRSI(values, period = RSI_PERIOD) {
-  if (values.length <= period) throw new Error('Not enough values for RSI');
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const change = values[i] - values[i - 1];
-    if (change >= 0) gains += change; else losses -= change;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  for (let i = period + 1; i < values.length; i++) {
-    const change = values[i] - values[i - 1];
-    const gain = Math.max(change, 0);
-    const loss = Math.max(-change, 0);
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-  }
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
+  try {
+    // Prepare data for SMC analysis
+    const open = candles.map(candle => candle.open);
+    const high = candles.map(candle => candle.high);
+    const low = candles.map(candle => candle.low);
+    const close = candles.map(candle => candle.close);
 
-function computeATRSeries(candles, period = ATR_PERIOD) {
-  if (candles.length <= period) throw new Error('Not enough candles for ATR');
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    const current = candles[i];
-    const prev = candles[i - 1];
-    const tr = Math.max(
-      current.high - current.low,
-      Math.abs(current.high - prev.close),
-      Math.abs(current.low - prev.close)
+    const response = await axios.post(
+      SMC_SERVER_URL,
+      { open, high, low, close },
+      { timeout: SMC_TIMEOUT_MS }
     );
-    trs.push(tr);
+
+    const data = response.data || {};
+    return {
+      signal: data.signal || 'NEUTRAL',
+      confidence: data.confidence || 0,
+      bias: data.smc_analysis?.bias || 'NEUTRAL',
+      explanation: data.explanation || 'No explanation available',
+      entry: data.entry,
+      sl: data.sl,
+      tp: data.tp,
+      trend: data.smc_analysis?.trend,
+      smc_analysis: data.smc_analysis
+    };
+  } catch (error) {
+    console.error('SMC server request failed:', error.message);
+    return {
+      signal: 'NEUTRAL',
+      confidence: 0,
+      error: error.message,
+      bias: 'NEUTRAL',
+      explanation: 'SMC server error'
+    };
   }
-
-  const atrValues = [];
-  let atr = trs.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
-  atrValues.push(atr);
-
-  for (let i = period; i < trs.length; i++) {
-    atr = (atr * (period - 1) + trs[i]) / period; // Wilder smoothing
-    atrValues.push(atr);
-  }
-
-  return atrValues;
 }
 
-function calculateSwingLevels(candles, lookback = SWING_LOOKBACK) {
-  if (candles.length < lookback) {
-    return { swingLow: null, swingHigh: null };
-  }
-
-  const recent = candles.slice(-lookback);
-  const swingLow = recent.reduce((min, candle) => Math.min(min, candle.low), Number.POSITIVE_INFINITY);
-  const swingHigh = recent.reduce((max, candle) => Math.max(max, candle.high), Number.NEGATIVE_INFINITY);
-
-  return {
-    swingLow: swingLow === Number.POSITIVE_INFINITY ? null : swingLow,
-    swingHigh: swingHigh === Number.NEGATIVE_INFINITY ? null : swingHigh
-  };
-}
-
-async function analyzeMarketRisk() {
+async function analyzeSMCMarket() {
   const candles = await fetchTimeSeries(SYMBOL, INTERVAL);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  const ema200 = computeEMA(closes, 200);
-  const rsi14 = computeRSI(closes, RSI_PERIOD);
-  const atrSeries = computeATRSeries(candles, ATR_PERIOD);
-  const atrCurrent = atrSeries[atrSeries.length - 1];
-  const atrWindow = atrSeries.slice(-ATR_BASELINE_LOOKBACK);
-  const atrBaseline = atrWindow.reduce((sum, value) => sum + value, 0) / atrWindow.length;
-  const signal = price > ema200 ? 'BUY' : price < ema200 ? 'SELL' : 'NEUTRAL';
+  const price = candles[candles.length - 1].close;
 
-  const rsiDistance = rsi14 > 70 ? rsi14 - 70 : rsi14 < 30 ? 30 - rsi14 : 0;
-  const rsiScore = Math.min(rsiDistance / 30, 1) * 40;
-
-  const atrRatio = atrBaseline > 0 ? atrCurrent / atrBaseline : 1;
-  const atrScore = Math.min(Math.max(atrRatio - 1, 0) / 1.5, 1) * 35;
-
-  const deviation = ema200 ? Math.abs(price - ema200) / ema200 : 0;
-  const trendScore = Math.min(deviation / 0.03, 1) * 25;
-
-  const rawRisk = rsiScore + atrScore + trendScore;
-  const riskScore = Math.min(parseFloat(rawRisk.toFixed(1)), 100);
-  const safeTrade = riskScore <= MAX_RISK_ALLOWED;
-  const { swingLow, swingHigh } = calculateSwingLevels(candles, SWING_LOOKBACK);
-
-  let sl = null;
-  let tp = null;
-
-  if (safeTrade && signal === 'BUY' && swingLow !== null) {
-    const riskDistance = price - swingLow;
-    if (riskDistance > 0) {
-      sl = swingLow;
-      tp = price + riskDistance * RISK_REWARD;
-    }
-  } else if (safeTrade && signal === 'SELL' && swingHigh !== null) {
-    const riskDistance = swingHigh - price;
-    if (riskDistance > 0) {
-      sl = swingHigh;
-      tp = price - riskDistance * RISK_REWARD;
-    }
-  }
+  // Get SMC analysis
+  const smcResult = await fetchSMCSignal(candles);
 
   return {
     price,
-    ema200,
-    rsi14,
-    atrCurrent,
-    atrBaseline,
-    deviationPercent: deviation * 100,
-    signal,
-    riskScore,
-    safeTrade,
-    sl,
-    tp
+    signal: smcResult.signal,
+    confidence: smcResult.confidence,
+    bias: smcResult.bias,
+    explanation: smcResult.explanation,
+    entry: smcResult.entry,
+    sl: smcResult.sl,
+    tp: smcResult.tp,
+    trend: smcResult.trend,
+    smc_analysis: smcResult.smc_analysis,
+    finalSignal: smcResult.signal // In SMC system, the signal is the final signal
   };
 }
 
 function formatSignalMessage(result) {
-  const { price, ema200, rsi14, atrCurrent, atrBaseline, deviationPercent, signal, riskScore, safeTrade, sl, tp } = result;
-  const riskEmoji = safeTrade ? '✅' : '⛔';
-  const signalEmoji = signal === 'BUY' ? '🟢' : signal === 'SELL' ? '🔴' : '⚪';
-  const verdictText = safeTrade ? 'Tavsiya qilinadi' : 'Yuqori xavf - Qatnashmang';
+  const { price, signal, confidence, bias, explanation, entry, sl, tp, trend, smc_analysis } = result;
+  const signalEmoji = signal === 'BUY' ? '🟢' : signal === 'SELL' ? '🔴' : '⚪️';
+  const verdictText = signal !== 'NEUTRAL' ? 'Tavsiya qilinadi' : 'Signal mavjud emas';
   const signalUz = signal === 'BUY' ? 'BUY' : signal === 'SELL' ? 'SELL' : 'NEYTRAL';
+
+  // Create trend text based on SMC trend
+  const trendText = trend === 'BULLISH' ? 'Yuksaluvchi trend (BUY mezonlar)' :
+                   trend === 'BEARISH' ? 'Pasayuvchi trend (SELL mezonlar)' :
+                   'Trend noaniq (RANGE)';
+
   const lines = [
-    `📊 XAU/USD ${INTERVAL} Smart Risk Assistant`,
+    `📊 XAU/USD ${INTERVAL} (15 daqiqa) Smart Money Concept Assistant`,
+    `🧭 Trend: ${trendText}`,
     `🏁 Signal: ${signalUz} ${signalEmoji}`,
-    `⚖️ Xavf darajasi: ${riskScore.toFixed(1)}% ${riskEmoji} (maks ${MAX_RISK_ALLOWED}%)`,
-    `🧭 Xulosa: ${safeTrade ? 'XAVFSIZ / TAVSIYA QILINGAN' : 'YUQORI XAVF / QATNASHMANG'} - ${verdictText}`,
-    `💰 Narx: ${price.toFixed(2)}`,
-    `📈 EMA200: ${ema200.toFixed(2)} (farq ${deviationPercent.toFixed(2)}%)`,
-    `📊 RSI14: ${rsi14.toFixed(2)}`,
-    `🌪️ ATR(${ATR_PERIOD}): ${atrCurrent.toFixed(2)} | O'rtacha ${ATR_BASELINE_LOOKBACK}: ${atrBaseline.toFixed(2)}`
+    `🎯 Yakuniy signal: ${signal}`,
+    `🤖 Ishonch: ${(confidence * 100).toFixed(1)}%`,
+    `💡 Tushuntirish: ${explanation}`,
+    `💰 Narx: ${price.toFixed(2)}`
   ];
 
-  if (safeTrade && sl !== null && tp !== null) {
-    lines.push(`🛡️ Stop Loss: ${sl.toFixed(2)} (swing ${SWING_LOOKBACK})`);
-    lines.push(`🎯 Take Profit: ${tp.toFixed(2)} (1:${RISK_REWARD} RR)`);
+  // Add SMC-specific details if available
+  if (smc_analysis) {
+    const bosCount = (smc_analysis.bos?.bullish?.length || 0) + (smc_analysis.bos?.bearish?.length || 0);
+    const chochCount = (smc_analysis.choch?.bullish?.length || 0) + (smc_analysis.choch?.bearish?.length || 0);
+    const fvgCount = smc_analysis.fvgZones?.length || 0;
+    const obCount = smc_analysis.orderBlocks?.length || 0;
+
+    if (bosCount > 0 || chochCount > 0 || fvgCount > 0 || obCount > 0) {
+      lines.push(`📈 SMC Elementlar:`);
+      if (bosCount > 0) lines.push(`   • BOS: ${bosCount} ta`);
+      if (chochCount > 0) lines.push(`   • CHOCH: ${chochCount} ta`);
+      if (fvgCount > 0) lines.push(`   • FVG: ${fvgCount} ta`);
+      if (obCount > 0) lines.push(`   • Order Block: ${obCount} ta`);
+    }
+  }
+
+  if (entry !== null && sl !== null && tp !== null) {
+    lines.push(`🎯 Entry: ${entry.toFixed(2)}`);
+    lines.push(`🛡️ Stop Loss: ${sl.toFixed(2)}`);
+    lines.push(`🎯 Take Profit: ${tp.toFixed(2)}`);
+    lines.push(`⚖️ Risk/Reward: ${(Math.abs(entry - tp) / Math.abs(entry - sl)).toFixed(1)}:1`);
   } else {
-    lines.push("⚠️ SL/TP: yuqori xavf yoki strukturaviy muammolar tufayi berilmagan.");
+    lines.push('⚠️ Entry/SL/TP: hali aniqlanmadi.');
   }
 
   return lines.join('\n');
@@ -205,27 +171,91 @@ function formatSignalMessage(result) {
 
 async function handleSniperSignal(ctx) {
   try {
-    await ctx.reply('🔍 XAU/USD 15m Smart Risk baholanmoqda...');
-    const result = await analyzeMarketRisk();
+    await ctx.reply('🔍 XAU/USD 15m Smart Money Concept tahlili...');
+    const result = await analyzeSMCMarket();
     await ctx.reply(formatSignalMessage(result));
   } catch (error) {
-    console.error('Smart Risk signali yaratishda xatolik:', error.message);
-    await ctx.reply(`Smart Risk baholash muvaffaqiyatsiz: ${error.message}`);
+    console.error('SMC signali yaratishda xatolik:', error.message);
+    await ctx.reply(`SMC tahlili muvaffaqiyatsiz: ${error.message}`);
   }
 }
 
-// Bot wiring: only the 15m sniper strategy is exposed to avoid noisy signals from other timeframes
+
+async function runAutoSignalPush() {
+  if (autoLoopRunning) return;
+  autoLoopRunning = true;
+  try {
+    if (subscribers.size === 0) {
+      lastAutoSignal = null;
+      return;
+    }
+
+    const result = await analyzeSMCMarket();
+    const actionable = result.signal !== 'NEUTRAL';
+
+    if (!actionable) {
+      if (result.signal === 'NEUTRAL') {
+        lastAutoSignal = null;
+      }
+      return;
+    }
+
+    // Only send signal if it's different from the last one
+    if (lastAutoSignal === result.signal) {
+      return;
+    }
+    lastAutoSignal = result.signal;
+
+    const autoMessage = `${formatSignalMessage(result)}\n⏱️ Avto-signal: SMC 15m monitoring`;
+    await Promise.allSettled(
+      [...subscribers].map(async (chatId) => {
+        try {
+          await bot.telegram.sendMessage(chatId, autoMessage);
+        } catch (error) {
+          console.error('Auto signal yuborishda xato:', error.message);
+          if (error?.response?.error_code === 403) {
+            subscribers.delete(chatId);
+          }
+        }
+      })
+    );
+  } catch (error) {
+    console.error('Auto SMC monitoring xatosi:', error.message);
+  } finally {
+    autoLoopRunning = false;
+  }
+}
+
+function ensureAutoMonitor() {
+  if (autoMonitorIntervalId) return;
+  autoMonitorIntervalId = setInterval(() => {
+    runAutoSignalPush();
+  }, AUTO_CHECK_INTERVAL_MS);
+}
+
+// Bot wiring: only the 15m SMC strategy is exposed to avoid noisy signals
 bot.start((ctx) => {
-  ctx.reply('🥇 Oltin Smart Risk Assistant tayyor. XAU/USD uchun 15m bahoni olish uchun tugmani bosing.', {
+  if (ctx.chat?.id) {
+    subscribers.add(ctx.chat.id);
+  }
+  ctx.reply('🔍 Oltin Smart Money Concept Assistant tayyor. 15m SMC signallari avtomatik kuzatuvda, qo\'lda so\'rov uchun tugmani bosing.', {
     reply_markup: {
       inline_keyboard: [
-        [{ text: '15m Smart Risk (XAU/USD)', callback_data: 'sniper_15m' }]
+        [{ text: '15m SMC Signal (XAU/USD)', callback_data: 'sniper_15m' }]
       ]
     }
   });
 });
 
-bot.action('sniper_15m', handleSniperSignal);
+bot.action('sniper_15m', async (ctx) => {
+  if (ctx.chat?.id) {
+    subscribers.add(ctx.chat.id);
+  }
+  await handleSniperSignal(ctx);
+});
+
+ensureAutoMonitor();
+
 
 // Check if running on Render or locally
 if (process.env.RENDER_EXTERNAL_URL) {
@@ -235,14 +265,14 @@ if (process.env.RENDER_EXTERNAL_URL) {
 
   // Health check route for Render
   app.get('/', (req, res) => {
-    res.send('Smart Risk Assistant bot is running!');
+    res.send('Smart Money Concept Assistant bot is running!');
   });
 
   // Set up webhook for Telegram
   app.use(bot.webhookCallback(`/bot${process.env.BOT_TOKEN}`));
 
   app.listen(port, () => {
-    console.log(`Smart Risk Assistant boti ${port}-portda ishga tushirildi...`);
+    console.log(`Smart Money Concept Assistant boti ${port}-portda ishga tushirildi...`);
     // Set webhook URL when deployed on Render
     // Check if RENDER_EXTERNAL_URL already includes the protocol
     let renderUrl = process.env.RENDER_EXTERNAL_URL;
@@ -272,7 +302,7 @@ if (process.env.RENDER_EXTERNAL_URL) {
 } else {
   // Running locally - use polling
   bot.launch();
-  console.log('Smart Risk Assistant boti polling rejimida ishga tushirildi...');
+  console.log('Smart Money Concept Assistant boti polling rejimida ishga tushirildi...');
 }
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

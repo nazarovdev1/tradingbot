@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic
+numpy
+pandas
+tensorflow
+pydantic.v1
