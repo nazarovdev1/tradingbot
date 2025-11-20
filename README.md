@@ -1,8 +1,10 @@
 # Forex Signal Telegram Bot - Multi-Timeframe Edition
 
 This is an advanced Forex Signal Telegram Bot that supports multiple timeframes and uses various technical indicators to generate trading signals for XAU/USD (Gold).
-
+// smc server
 python -m uvicorn smc_server:app --host 0.0.0.0 --port 8000
+// backtest server
+python backtest/run_backtest.py --data sample_data_extended.csv --initial-cash 10000
 
 ## Features
 - **Multi-timeframe support**: 3min, 15min, 1h, and 1day timeframes

@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 
@@ -212,10 +212,10 @@ async function fetchSMCSignal(candles) {
 
 async function fetchAIPrediction(closes) {
   if (!AI_SERVER_URL) {
-    console.log('AI server URL missing');
+    console.log('AI server URL missing - returning neutral with 50% confidence');
     return {
       signal: 'NEUTRAL',
-      confidence: 0,
+      confidence: 0.5,  // Neutral confidence
       error: 'AI server URL missing'
     };
   }
@@ -228,7 +228,7 @@ async function fetchAIPrediction(closes) {
       console.log('Not enough valid close prices for AI prediction:', validCloses.length);
       return {
         signal: 'NEUTRAL',
-        confidence: 0,
+        confidence: 0.5,  // Neutral confidence
         error: 'Insufficient data for AI'
       };
     }
@@ -243,15 +243,26 @@ async function fetchAIPrediction(closes) {
     const data = response.data || {};
     console.log(`AI Prediction: Signal=${data.signal}, Confidence=${data.confidence}`);
 
+    // Protect against extremely low confidence values
+    const confidence = data.confidence || 0;
+    const adjustedConfidence = Math.max(0.01, Math.min(1.0, confidence)); // Clamp between 0.01 and 1.0
+
     return {
       signal: data.signal || 'NEUTRAL',
-      confidence: data.confidence || 0
+      confidence: adjustedConfidence
     };
   } catch (error) {
     console.error('AI server request failed:', error.message);
+    console.error('Error details:', {
+      status: error.response ? error.response.status : 'No response',
+      statusText: error.response ? error.response.statusText : 'No response',
+      data: error.response ? error.response.data : 'No response data'
+    });
+
+    // Return neutral with moderate confidence instead of 0
     return {
       signal: 'NEUTRAL',
-      confidence: 0,
+      confidence: 0.3,  // Moderate confidence to allow basic functionality
       error: error.message
     };
   }

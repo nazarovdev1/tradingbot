@@ -1,0 +1,13 @@
+{
+  "total_trades": 40,
+  "wins": 40,
+  "losses": 0,
+  "win_rate": 1.0,
+  "profit_factor": Infinity,
+  "sharpe_ratio": 6.041308231372038,
+  "max_drawdown": 0.0,
+  "total_return": 1.2080396636148523,
+  "final_balance": 22080.39663614852,
+  "initial_balance": 10000.0,
+  "pnl": 12080.396636148522
+}
