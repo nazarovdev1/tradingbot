@@ -1,519 +1,408 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 
-const SYMBOL = 'XAU/USD';
-const INTERVAL = '15min';
-const CANDLE_COUNT = 320; // enough bars to cover SMC calculations
-const MAX_RISK_ALLOWED = 40;
-const SWING_LOOKBACK = 10;
-const RISK_REWARD = 2;
-const AUTO_CHECK_INTERVAL_MS = parseInt(process.env.AUTO_CHECK_INTERVAL_MS || '300000', 10);
-const SMC_SERVER_URL = process.env.SMC_SERVER_URL || 'http://127.0.0.1:8000/smc';
-const AI_SERVER_URL = process.env.AI_SERVER_URL || 'http://127.0.0.1:8000/predict';
-const SMC_TIMEOUT_MS = parseInt(process.env.SMC_TIMEOUT_MS || '10000', 10);
-const AI_TIMEOUT_MS = parseInt(process.env.AI_TIMEOUT_MS || '5000', 10);
-const AI_CONFIDENCE_THRESHOLD = 0.85; // Only accept signals with >85% confidence
-
-const subscribers = new Set();
-let autoMonitorIntervalId = null;
-let autoLoopRunning = false;
-let lastAutoSignal = null;
-
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const express = require('express');
+const STRATEGY_SERVER_URL = 'http://localhost:5000/analyze';
+const TIMEFRAME = '15min';
+const TIMEFRAME_LABEL = '15min (15 daqiqa)';
+const MAX_RISK_ALLOWED = 40;
+const ALERT_COOLDOWN = 300000; // 5 minutes
 
-async function fetchTimeSeries(symbol, interval) {
-  const response = await axios.get('https://api.twelvedata.com/time_series', {
-    params: {
-      symbol,
-      interval,
-      outputsize: CANDLE_COUNT,
-      apikey: process.env.TWELVEDATA_KEY
-    }
-  });
+let lastCandleTime = 0;
+let lastAlert = 0;
 
-  if (!response.data || response.data.status === 'error') {
-    throw new Error(response.data?.message || 'Failed to fetch time series');
-  }
+// Function to fetch OHLC data from TwelveData (supports XAU/USD)
+async function fetchOHLCV(symbol = 'XAU/USD', timeframe = TIMEFRAME, limit = 100) {
+    try {
+        const response = await axios.get('https://api.twelvedata.com/time_series', {
+            params: {
+                symbol,
+                interval: timeframe,
+                outputsize: limit,
+                apikey: process.env.TWELVEDATA_KEY
+            }
+        });
 
-  if (!Array.isArray(response.data.values) || response.data.values.length < 50) { // Reduced min for SMC
-    throw new Error('Not enough data to compute SMC indicators');
-  }
-
-  // TwelveData returns newest first; reverse for chronological calculations
-  return response.data.values
-    .map((candle) => ({
-      time: candle.datetime,
-      open: parseFloat(candle.open),
-      high: parseFloat(candle.high),
-      low: parseFloat(candle.low),
-      close: parseFloat(candle.close)
-    }))
-    .reverse();
-}
-
-async function fetchSMCSignal(candles) {
-  if (!SMC_SERVER_URL) {
-    console.log('SMC server URL missing');
-    return {
-      validSMCZone: false,
-      bias: 'NEUTRAL',
-      entry: null,
-      sl: null,
-      tp: null,
-      explanation: 'SMC server not configured',
-      smc_analysis: null
-    };
-  }
-
-  try {
-    // Prepare data for SMC analysis - ensure all values are valid floats
-    const open = candles.map(candle => parseFloat(candle.open)).filter(v => !isNaN(v) && isFinite(v));
-    const high = candles.map(candle => parseFloat(candle.high)).filter(v => !isNaN(v) && isFinite(v));
-    const low = candles.map(candle => parseFloat(candle.low)).filter(v => !isNaN(v) && isFinite(v));
-    const close = candles.map(candle => parseFloat(candle.close)).filter(v => !isNaN(v) && isFinite(v));
-
-    // Validate that all arrays have the same length
-    if (open.length !== high.length || high.length !== low.length || low.length !== close.length) {
-      console.error('Data validation failed: arrays have different lengths');
-      return {
-        validSMCZone: false,
-        bias: 'NEUTRAL',
-        entry: null,
-        sl: null,
-        tp: null,
-        explanation: 'Invalid data from API',
-        smc_analysis: null
-      };
-    }
-
-    // Ensure we have enough data
-    if (close.length < 10) {
-      console.error('Not enough valid data points:', close.length);
-      return {
-        validSMCZone: false,
-        bias: 'NEUTRAL',
-        entry: null,
-        sl: null,
-        tp: null,
-        explanation: 'Insufficient data',
-        smc_analysis: null
-      };
-    }
-
-    console.log(`Sending ${close.length} candles to SMC server...`);
-    console.log(`First few values - Open: ${open.slice(0, 3)}, High: ${high.slice(0, 3)}, Low: ${low.slice(0, 3)}, Close: ${close.slice(0, 3)}`);
-
-    const payload = {
-      open: open,
-      high: high,
-      low: low,
-      close: close
-    };
-
-    const response = await axios.post(
-      SMC_SERVER_URL,
-      payload,
-      {
-        timeout: SMC_TIMEOUT_MS,
-        headers: {
-          'Content-Type': 'application/json'
+        if (!response.data || response.data.status === 'error') {
+            throw new Error(response.data?.message || 'Failed to fetch data from TwelveData');
         }
-      }
-    );
 
-    const data = response.data || {};
-
-    // Check if price is in a valid SMC zone (Order Block or FVG)
-    const currentPrice = close[close.length - 1];
-    let validSMCZone = false;
-    let zoneType = '';
-    let zoneEntry = null;
-    let calculatedSL = null;
-    let calculatedTP = null;
-
-    // Check for valid Order Blocks in range
-    if (data.orderBlocks && data.orderBlocks.length > 0) {
-      for (const ob of data.orderBlocks) {
-        if (ob.type.includes('bullish') && currentPrice >= ob.low && currentPrice <= ob.high) {
-          validSMCZone = true;
-          zoneType = 'BULLISH ORDER BLOCK';
-          zoneEntry = ob.high; // Entry at the top of bullish OB
-          calculatedSL = ob.low - (Math.abs(ob.high - ob.low) * 0.1); // 10% below OB low
-          calculatedTP = ob.high + (Math.abs(ob.high - calculatedSL) * RISK_REWARD); // 1:2 RR
-          break;
-        } else if (ob.type.includes('bearish') && currentPrice >= ob.low && currentPrice <= ob.high) {
-          validSMCZone = true;
-          zoneType = 'BEARISH ORDER BLOCK';
-          zoneEntry = ob.low; // Entry at the bottom of bearish OB
-          calculatedSL = ob.high + (Math.abs(ob.high - ob.low) * 0.1); // 10% above OB high
-          calculatedTP = ob.low - (Math.abs(calculatedSL - ob.low) * RISK_REWARD); // 1:2 RR
-          break;
+        const values = Array.isArray(response.data.values) ? response.data.values.slice().reverse() : [];
+        if (values.length === 0) {
+            throw new Error('Empty response from TwelveData');
         }
-      }
+
+        return {
+            open: values.map(item => parseFloat(item.open)),
+            high: values.map(item => parseFloat(item.high)),
+            low: values.map(item => parseFloat(item.low)),
+            close: values.map(item => parseFloat(item.close)),
+            volume: values.map(item => parseFloat(item.volume || 0)),
+            timestamps: values.map(item => new Date(item.datetime).getTime())
+        };
+    } catch (error) {
+        console.error('Error fetching OHLCV data:', error.message);
+        throw error;
     }
+}
 
-    // If no valid OB, check for FVG
-    if (!validSMCZone && data.fvgZones && data.fvgZones.length > 0) {
-      for (const fvg of data.fvgZones) {
-        if (currentPrice >= fvg.low && currentPrice <= fvg.high) {
-          validSMCZone = true;
-          zoneType = fvg.type === 'bullish_fvg' ? 'BULLISH FVG' : 'BEARISH FVG';
-          zoneEntry = fvg.entry;
+function calculateEMA(values, period) {
+    if (values.length < period) throw new Error(`Need at least ${period} closes for EMA`);
+    const k = 2 / (period + 1);
+    let ema = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+    for (let i = period; i < values.length; i++) {
+        ema = values[i] * k + ema * (1 - k);
+    }
+    return ema;
+}
 
-          // Calculate SL and TP for FVG
-          if (fvg.type === 'bullish_fvg') {
-            calculatedSL = fvg.low - (Math.abs(fvg.high - fvg.low) * 0.1); // 10% below FVG low
-            calculatedTP = fvg.high + (Math.abs(fvg.high - calculatedSL) * RISK_REWARD); // 1:2 RR
-          } else {
-            calculatedSL = fvg.high + (Math.abs(fvg.high - fvg.low) * 0.1); // 10% above FVG high
-            calculatedTP = fvg.low - (Math.abs(calculatedSL - fvg.low) * RISK_REWARD); // 1:2 RR
-          }
-          break;
+function calculateRSI(values, period = 14) {
+    if (values.length <= period) throw new Error('Not enough closes for RSI');
+    let gains = 0;
+    let losses = 0;
+    for (let i = 1; i <= period; i++) {
+        const diff = values[i] - values[i - 1];
+        if (diff >= 0) gains += diff; else losses -= diff;
+    }
+    let avgGain = gains / period;
+    let avgLoss = losses / period;
+    for (let i = period + 1; i < values.length; i++) {
+        const diff = values[i] - values[i - 1];
+        const gain = diff > 0 ? diff : 0;
+        const loss = diff < 0 ? -diff : 0;
+        avgGain = ((avgGain * (period - 1)) + gain) / period;
+        avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+    }
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - 100 / (1 + rs);
+}
+
+function calculateATR(highs, lows, closes, period = 14) {
+    if (highs.length <= period || lows.length <= period || closes.length <= period) {
+        throw new Error('Not enough candles for ATR');
+    }
+    const trs = [];
+    for (let i = 1; i < highs.length; i++) {
+        const high = highs[i];
+        const low = lows[i];
+        const prevClose = closes[i - 1];
+        const tr = Math.max(
+            high - low,
+            Math.abs(high - prevClose),
+            Math.abs(low - prevClose)
+        );
+        trs.push(tr);
+    }
+    let atr = trs.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+    const atrSeries = [atr];
+    for (let i = period; i < trs.length; i++) {
+        atr = ((atr * (period - 1)) + trs[i]) / period;
+        atrSeries.push(atr);
+    }
+    return atrSeries;
+}
+
+function calculateSwingLevels(lows, highs, lookback = 10) {
+    if (lows.length < lookback || highs.length < lookback) return { swingLow: null, swingHigh: null };
+    const recentLows = lows.slice(-lookback);
+    const recentHighs = highs.slice(-lookback);
+    const swingLow = recentLows.reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
+    const swingHigh = recentHighs.reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
+    return {
+        swingLow: swingLow === Number.POSITIVE_INFINITY ? null : swingLow,
+        swingHigh: swingHigh === Number.NEGATIVE_INFINITY ? null : swingHigh
+    };
+}
+
+function buildRiskSnapshot(data) {
+    const closes = data.close;
+    const highs = data.high;
+    const lows = data.low;
+    if (closes.length < 210) throw new Error('Not enough data for risk snapshot');
+
+    const price = closes[closes.length - 1];
+    const ema200 = calculateEMA(closes, 200);
+    const ema50 = calculateEMA(closes, 50);
+    const rsi14 = calculateRSI(closes, 14);
+    const atrSeries = calculateATR(highs, lows, closes, 14);
+    const atrCurrent = atrSeries[atrSeries.length - 1];
+    const atrBaseline = atrSeries.slice(-10).reduce((sum, value) => sum + value, 0) / Math.min(10, atrSeries.length);
+    const deviation = ema200 ? Math.abs(price - ema200) / ema200 : 0;
+    const deviationPercent = deviation * 100;
+    const nearEma = deviation <= 0.005;
+    const inBreakoutZone = deviation <= 0.012;
+    const atrRatio = atrBaseline > 0 ? atrCurrent / atrBaseline : 1;
+
+    const rsiMidDistance = Math.max(0, Math.abs(rsi14 - 50) - 10);
+    const rsiScore = Math.min(rsiMidDistance / 40, 1) * 35;
+    const deviationPenalty = Math.max(0, deviation - 0.005);
+    const deviationRange = Math.max(0.012 - 0.005, 0.0001);
+    const deviationScore = Math.min(deviationPenalty / deviationRange, 1) * 40;
+    let atrScore = 0;
+    if (atrRatio < 0.8) {
+        atrScore = Math.min((0.8 - atrRatio) / 0.8, 1) * 25;
+    } else if (atrRatio > 1.8) {
+        atrScore = Math.min((atrRatio - 1.8) / 1.8, 1) * 25;
+    }
+    const riskScore = Math.min(Number((deviationScore + rsiScore + atrScore).toFixed(1)), 100);
+    const safeTrade = riskScore <= MAX_RISK_ALLOWED;
+
+    const trendBias = price > ema200 ? 'BULLISH' : price < ema200 ? 'BEARISH' : 'FLAT';
+    const shortTrendBias = price > ema50 ? 'BULLISH' : price < ema50 ? 'BEARISH' : 'FLAT';
+    const atrState = atrRatio < 0.8 ? 'past' : atrRatio > 1.8 ? 'juda yuqori' : 'barqaror';
+    const pullbackText = nearEma
+        ? '✅ EMA200 yaqinida, pullback tasdiqlandi'
+        : inBreakoutZone
+            ? `⚡️ Momentum break-out (EMA200 dan ${deviationPercent.toFixed(2)}% uzoqda)`
+            : `⚠️ Narx EMA200 dan ${deviationPercent.toFixed(2)}% uzoqda`;
+
+    const { swingLow, swingHigh } = calculateSwingLevels(lows, highs, 10);
+
+    return {
+        price,
+        ema200,
+        ema50,
+        rsi14,
+        atrCurrent,
+        atrBaseline,
+        atrRatio,
+        deviationPercent,
+        nearEma,
+        inBreakoutZone,
+        trendBias,
+        shortTrendBias,
+        atrState,
+        pullbackText,
+        riskScore,
+        safeTrade,
+        swingLow,
+        swingHigh
+    };
+}
+
+function determineFinalSignal(strategySignal, aiSignal) {
+    const strat = (strategySignal || 'NEUTRAL').toUpperCase();
+    const ai = (aiSignal || 'NEUTRAL').toUpperCase();
+    if (ai === 'NEUTRAL' || strat === ai) return strat;
+    return strat;
+}
+
+// Function to analyze market with the new strategy server
+async function analyzeWithStrategyServer(data, symbol = 'XAU/USD') {
+    try {
+        const payload = {
+            symbol: symbol,
+            open: data.open,
+            high: data.high,
+            low: data.low,
+            close: data.close,
+            volume: data.volume
+        };
+
+        const response = await axios.post(STRATEGY_SERVER_URL, payload, {
+            timeout: 15000 // 15 seconds timeout for more complex analysis
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error('Error from strategy server:', error.message);
+        console.error('Make sure strategy server is running on http://localhost:5000/analyze');
+
+        // Return a neutral result instead of throwing error
+        return {
+            signal: 'NEUTRAL',
+            entry: null,
+            sl: null,
+            tp: null,
+            reason: 'SERVER_ERROR',
+            confidence: 0.0
+        };
+    }
+}
+
+// Main analysis loop
+async function analyzeMarket() {
+    try {
+        console.log(`Starting market analysis for XAU/USD (${TIMEFRAME_LABEL})...`);
+
+        // Fetch latest OHLCV data for XAU/USD
+        const data = await fetchOHLCV('XAU/USD', TIMEFRAME, 320); // 15-minute timeframe
+        const snapshot = buildRiskSnapshot(data);
+
+        // Get the latest candle time
+        const latestCandleTime = data.timestamps[data.timestamps.length - 1];
+
+        // Only process if it's a new candle (not already processed)
+        if (latestCandleTime <= lastCandleTime) {
+            console.log('Candle already processed, skipping...');
+            return;
         }
-      }
-    }
 
-    console.log(`SMC Analysis: Valid Zone=${validSMCZone}, Type=${zoneType}`);
+        console.log(`Processing new candle at ${new Date(latestCandleTime).toISOString()}`);
+        lastCandleTime = latestCandleTime;
 
-    let bias = 'NEUTRAL';
-    if (validSMCZone) {
-      if (zoneType.includes('BULLISH')) {
-        bias = 'BUY';
-      } else if (zoneType.includes('BEARISH')) {
-        bias = 'SELL';
-      }
-    }
+        // Analyze with the new strategy server
+        const strategyResult = await analyzeWithStrategyServer(data, 'XAU/USD');
+        console.log('Strategy Analysis:', strategyResult);
 
-    return {
-      validSMCZone,
-      zoneType,
-      bias,
-      entry: zoneEntry,
-      sl: calculatedSL,
-      tp: calculatedTP,
-      explanation: data.explanation || 'No explanation available',
-      smc_analysis: data
-    };
-  } catch (error) {
-    console.error('SMC server request failed:', error.message);
-    return {
-      validSMCZone: false,
-      bias: 'NEUTRAL',
-      entry: null,
-      sl: null,
-      tp: null,
-      explanation: 'SMC server error: ' + error.message,
-      smc_analysis: null
-    };
-  }
-}
+        const normalizedSignal = (strategyResult.signal || 'NEUTRAL').toUpperCase();
 
-async function fetchAIPrediction(closes) {
-  if (!AI_SERVER_URL) {
-    console.log('AI server URL missing - returning neutral with 50% confidence');
-    return {
-      signal: 'NEUTRAL',
-      confidence: 0.5,  // Neutral confidence
-      error: 'AI server URL missing'
-    };
-  }
+        if (strategyResult && normalizedSignal !== 'NEUTRAL') {
+            // Check if signal confidence is high enough
+            if (strategyResult.confidence >= 0.6) { // At least 60% confidence
+                // Check if enough time has passed since last alert
+                if (Date.now() - lastAlert > ALERT_COOLDOWN) {
+                    // Send alert to all users
+                    const message = formatSignalMessage({
+                        symbol: 'XAU/USD',
+                        timeframe: TIMEFRAME_LABEL,
+                        strategyResult,
+                        snapshot
+                    });
 
-  try {
-    // Ensure all closes are valid floats
-    const validCloses = closes.map(c => parseFloat(c)).filter(v => !isNaN(v) && isFinite(v));
+                    // Broadcast to all users (we'll send to users who have started the bot)
+                    // In a real implementation, you'd have a list of subscribed chat IDs
+                    console.log('Sending alert:', message);
 
-    if (validCloses.length < 20) {
-      console.log('Not enough valid close prices for AI prediction:', validCloses.length);
-      return {
-        signal: 'NEUTRAL',
-        confidence: 0.5,  // Neutral confidence
-        error: 'Insufficient data for AI'
-      };
-    }
+                    // For now, we'll just log it - in real implementation, broadcast to all users
+                    // await bot.telegram.sendMessage(chatId, message);
 
-    console.log('Asking AI for confirmation...');
-    const response = await axios.post(
-      AI_SERVER_URL,
-      { closes: validCloses },
-      { timeout: AI_TIMEOUT_MS }
-    );
-
-    const data = response.data || {};
-    console.log(`AI Prediction: Signal=${data.signal}, Confidence=${data.confidence}`);
-
-    // Protect against extremely low confidence values
-    const confidence = data.confidence || 0;
-    const adjustedConfidence = Math.max(0.01, Math.min(1.0, confidence)); // Clamp between 0.01 and 1.0
-
-    return {
-      signal: data.signal || 'NEUTRAL',
-      confidence: adjustedConfidence
-    };
-  } catch (error) {
-    console.error('AI server request failed:', error.message);
-    console.error('Error details:', {
-      status: error.response ? error.response.status : 'No response',
-      statusText: error.response ? error.response.statusText : 'No response',
-      data: error.response ? error.response.data : 'No response data'
-    });
-
-    // Return neutral with moderate confidence instead of 0
-    return {
-      signal: 'NEUTRAL',
-      confidence: 0.3,  // Moderate confidence to allow basic functionality
-      error: error.message
-    };
-  }
-}
-
-async function analyzeSMCMarket() {
-  const candles = await fetchTimeSeries(SYMBOL, INTERVAL);
-  const price = candles[candles.length - 1].close;
-
-  // Step 1: SMC Check (The Location)
-  const smcResult = await fetchSMCSignal(candles);
-
-  if (!smcResult.validSMCZone) {
-    console.log('Price is NOT in a valid SMC zone. No signal generated.');
-    return {
-      price,
-      signal: 'NEUTRAL',
-      confidence: 0,
-      explanation: 'No valid SMC zone detected at current price level',
-      entry: null,
-      sl: null,
-      tp: null
-    };
-  }
-
-  console.log(`Price in ${smcResult.zoneType}. Proceeding to Step 2 - AI Confirmation.`);
-
-  // Step 2: AI Confirmation (The Filter)
-  const closes = candles.map(candle => candle.close);
-  const aiResult = await fetchAIPrediction(closes);
-
-  // Check if AI confidence meets threshold and direction matches SMC
-  const aiConfidenceOk = aiResult.confidence >= AI_CONFIDENCE_THRESHOLD;
-  const directionMatch = (smcResult.bias === 'BUY' && aiResult.signal === 'BUY') ||
-    (smcResult.bias === 'SELL' && aiResult.signal === 'SELL');
-
-  if (!aiConfidenceOk) {
-    console.log(`AI rejected signal (Confidence too low: ${aiResult.confidence} < ${AI_CONFIDENCE_THRESHOLD})`);
-    return {
-      price,
-      signal: 'NEUTRAL',
-      confidence: aiResult.confidence,
-      explanation: `Valid SMC zone detected (${smcResult.zoneType}) but AI confidence too low (${(aiResult.confidence * 100).toFixed(1)}%)`,
-      entry: null,
-      sl: null,
-      tp: null
-    };
-  }
-
-  if (!directionMatch) {
-    console.log(`AI rejected signal (Direction mismatch: SMC=${smcResult.bias} vs AI=${aiResult.signal})`);
-    return {
-      price,
-      signal: 'NEUTRAL',
-      confidence: aiResult.confidence,
-      explanation: `Valid SMC zone detected (${smcResult.zoneType}) but AI direction doesn't match (SMC: ${smcResult.bias} vs AI: ${aiResult.signal})`,
-      entry: null,
-      sl: null,
-      tp: null
-    };
-  }
-
-  // Step 3: Execution
-  console.log('Confluence confirmed! SMC zone + AI confirmation > 85% confidence');
-
-  return {
-    price,
-    signal: smcResult.bias,
-    confidence: aiResult.confidence,
-    explanation: `CONFLUENCE SIGNAL: ${smcResult.zoneType} confirmed with ${aiResult.signal} AI prediction (${(aiResult.confidence * 100).toFixed(1)}% confidence)`,
-    entry: smcResult.entry,
-    sl: smcResult.sl,
-    tp: smcResult.tp
-  };
-}
-
-function formatSignalMessage(result) {
-  const { price, signal, confidence, explanation, entry, sl, tp } = result;
-  const signalEmoji = signal === 'BUY' ? '🟢' : signal === 'SELL' ? '🔴' : '⚪️';
-  const confidencePercent = (confidence * 100).toFixed(1);
-
-  const lines = [
-    `🎯 SMC + AI CONFLUENCE SNIPER SIGNAL 🎯`,
-    ` `,
-    `💡 Signal: ${signal} ${signalEmoji}`,
-    ` `,
-    `📈 Symbol: ${SYMBOL} | Timeframe: ${INTERVAL}`,
-    `💰 Current Price: ${price.toFixed(4)}`,
-    `🤖 AI Confidence: ${confidencePercent}%`,
-    ` `,
-    `🎯 Entry: ${entry ? entry.toFixed(4) : 'N/A'}`,
-    `🛡️ Stop Loss: ${sl ? sl.toFixed(4) : 'N/A'}`,
-    `🎯 Take Profit: ${tp ? tp.toFixed(4) : 'N/A'}`,
-    ` `,
-    `📋 Explanation:`,
-    `${explanation}`
-  ];
-
-  if (entry !== null && sl !== null && tp !== null) {
-    // Calculate risk and reward
-    const risk = Math.abs(entry - sl);
-    const reward = Math.abs(tp - entry);
-    const riskReward = risk > 0 ? (reward / risk).toFixed(2) : 'N/A';
-
-    lines.push(` `,
-      `⚖️ Risk/Reward: ${riskReward}:1`,
-      ` `,
-      `⚠️ ALWAYS use proper risk management!`);
-  }
-
-  return lines.join('\n');
-}
-
-async function handleSniperSignal(ctx) {
-  try {
-    await ctx.reply('🔍 Running Sniper Strategy Scan...');
-    const result = await analyzeSMCMarket();
-
-    if (result.signal !== 'NEUTRAL') {
-      await ctx.reply(formatSignalMessage(result));
-    } else {
-      await ctx.reply(`⚪️ No confluence signal detected.\n${result.explanation}`);
-    }
-  } catch (error) {
-    console.error('Sniper strategy scan failed:', error.message);
-    await ctx.reply(`❌ Sniper strategy scan failed: ${error.message}`);
-  }
-}
-
-async function runAutoSignalPush() {
-  if (autoLoopRunning) return;
-  autoLoopRunning = true;
-  try {
-    if (subscribers.size === 0) {
-      lastAutoSignal = null;
-      return;
-    }
-
-    const result = await analyzeSMCMarket();
-    const actionable = result.signal !== 'NEUTRAL';
-
-    if (!actionable) {
-      // Only reset last signal if we had a previous actionable signal
-      if (lastAutoSignal !== null) {
-        console.log('No actionable signal found, clearing last signal');
-        lastAutoSignal = null;
-      }
-      return;
-    }
-
-    // Only send signal if it's different from the last one
-    if (lastAutoSignal === result.signal) {
-      console.log('Same signal as last time, skipping');
-      return;
-    }
-
-    lastAutoSignal = result.signal;
-    console.log(`Sending new confluence signal: ${result.signal}`);
-
-    const autoMessage = formatSignalMessage(result);
-    await Promise.allSettled(
-      [...subscribers].map(async (chatId) => {
-        try {
-          await bot.telegram.sendMessage(chatId, autoMessage);
-        } catch (error) {
-          console.error('Auto signal delivery failed:', error.message);
-          if (error?.response?.error_code === 403) {
-            subscribers.delete(chatId);
-          }
+                    lastAlert = Date.now();
+                } else {
+                    console.log('Alert cooldown active, skipping...');
+                }
+            } else {
+                console.log(`Signal confidence too low: ${(strategyResult.confidence * 100).toFixed(1)}%. Required: >=60%.`);
+            }
+        } else {
+            console.log('No valid signal generated from strategy server');
         }
-      })
-    );
-  } catch (error) {
-    console.error('Auto Sniper monitoring error:', error.message);
-  } finally {
-    autoLoopRunning = false;
-  }
+    } catch (error) {
+        console.error('Error in analyzeMarket:', error.message);
+    }
 }
 
-function ensureAutoMonitor() {
-  if (autoMonitorIntervalId) return;
-  autoMonitorIntervalId = setInterval(() => {
-    runAutoSignalPush();
-  }, AUTO_CHECK_INTERVAL_MS);
+// Function to format signal message
+function formatSignalMessage({ symbol, timeframe, strategyResult, snapshot }) {
+    const strategySignal = (strategyResult.signal || 'NEUTRAL').toUpperCase();
+    const aiSignalRaw = strategyResult.aiSignal || 'NEUTRAL';
+    const aiSignal = aiSignalRaw.toUpperCase();
+    const aiConfidence = strategyResult.aiConfidence ?? 0;
+    const finalSignal = determineFinalSignal(strategySignal, aiSignal);
+    const riskEmoji = snapshot.safeTrade ? '✅' : '⚠️';
+    const trendText = snapshot.trendBias === 'BULLISH'
+        ? 'Yuksaluvchi trend (narx EMA200 dan yuqori)'
+        : snapshot.trendBias === 'BEARISH'
+            ? 'Pasayuvchi trend (narx EMA200 dan past)'
+            : 'Trend noaniq (narx EMA200 atrofida)';
+    const trend50Text = snapshot.shortTrendBias === 'BULLISH'
+        ? 'EMA50 ham yuqoriga qaratilgan (momentum BUY bilan)'
+        : snapshot.shortTrendBias === 'BEARISH'
+            ? 'EMA50 pastga og\'di (momentum SELL bilan)'
+            : 'EMA50 neytral, momentum yetarli emas';
+
+    const entry = strategyResult.entry ?? snapshot.price;
+    let sl = strategyResult.sl;
+    let tp = strategyResult.tp;
+    if (!sl) {
+        sl = finalSignal === 'BUY' ? snapshot.swingLow : snapshot.swingHigh;
+    }
+    if (!tp && typeof sl === 'number' && typeof entry === 'number') {
+        const riskDistance = Math.abs(entry - sl);
+        tp = finalSignal === 'BUY' ? entry + riskDistance * 2 : entry - riskDistance * 2;
+    }
+
+    const formatPrice = (value) => (typeof value === 'number' ? value.toFixed(2) : 'N/A');
+
+    return `📊 ${symbol} ${timeframe} Smart Risk Assistant
+🧭 Trend200: ${trendText}
+📉 Trend50: ${trend50Text}
+↩️ Pullback/Momentum: ${snapshot.pullbackText}
+🏁 Signal: ${finalSignal} ${finalSignal === 'BUY' ? '🟢' : finalSignal === 'SELL' ? '🔴' : '⚪️'}
+🤖 AI Signal: ${aiSignal} (ishonch ${aiConfidence.toFixed(2)})
+🎯 Yakuniy signal: ${finalSignal}
+⚖️ Xavf darajasi: ${snapshot.riskScore.toFixed(1)}% ${riskEmoji} (maks ${MAX_RISK_ALLOWED}%)
+🧭 Xulosa: ${snapshot.safeTrade ? 'XAVFSIZ / TAVSIYA QILINGAN' : 'YUQORI XAVF / QATNASHMANG'} - ${snapshot.safeTrade ? 'Tavsiya qilinadi' : 'Qatnashmang'}
+💰 Narx: ${formatPrice(snapshot.price)}
+📈 EMA200: ${formatPrice(snapshot.ema200)} | EMA50: ${formatPrice(snapshot.ema50)} (farq ${snapshot.deviationPercent.toFixed(2)}%)
+📊 RSI14: ${snapshot.rsi14.toFixed(2)} (prefer 40-60 koridor)
+🌪️ ATR(14): ${formatPrice(snapshot.atrCurrent)} | O'rtacha 10: ${formatPrice(snapshot.atrBaseline)} (holat: ${snapshot.atrState})
+🛡️ Stop Loss: ${formatPrice(sl)}
+🎯 Take Profit: ${formatPrice(tp)}
+⏱️ Avto-signal: Sniper ${TIMEFRAME_LABEL} monitoring`;
 }
 
-// Bot wiring: only the Sniper strategy is exposed
+
+
+// Set up the analysis interval
+function startMarketAnalysis() {
+    // Run analysis immediately
+    analyzeMarket();
+
+    // Run analysis every 15 minutes for XAU/USD
+    setInterval(analyzeMarket, 15 * 60 * 1000);
+
+    console.log('Market analysis loop started for XAU/USD (15m)...');
+}
+
+// Telegram command handlers
 bot.start((ctx) => {
-  if (ctx.chat?.id) {
-    subscribers.add(ctx.chat.id);
-  }
-  ctx.reply('🎯 SMC + AI Confluence Sniper Bot is ready!\n\nThe bot scans for high-probability setups using Smart Money Concepts + AI confirmation.\n\nSignals are only sent when:\n• Price is in a valid SMC zone (OB/FVG)\n• AI confirms direction with >85% confidence\n\nUse the button below for manual scan:', {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🔍 Manual Sniper Scan', callback_data: 'sniper_15m' }]
-      ]
-    }
-  });
+    ctx.reply(`🎯 SMC+AI XAU/USD Trading Bot is active!
+
+This bot monitors XAU/USD for trading signals based on:
+• Smart Money Concepts (SMC)
+• AI Predictions
+• Risk Management
+
+Commands available:
+/analyze - Force immediate analysis of XAU/USD
+/status - Show current market status
+
+Signals include Entry, Stop Loss, and Take Profit levels.`);
 });
 
-bot.action('sniper_15m', async (ctx) => {
-  if (ctx.chat?.id) {
-    subscribers.add(ctx.chat.id);
-  }
-  await handleSniperSignal(ctx);
+bot.command('analyze', async (ctx) => {
+    try {
+        await ctx.reply('🔄 Running manual market analysis for XAU/USD...');
+        await analyzeMarket();
+        await ctx.reply('✅ Analysis completed. Check console for results.');
+    } catch (error) {
+        console.error('Error in manual analysis:', error.message);
+        await ctx.reply('❌ Error during analysis. Check logs.');
+    }
 });
 
-ensureAutoMonitor();
+bot.command('status', async (ctx) => {
+    try {
+        const data = await fetchOHLCV('XAU/USD', TIMEFRAME, 320);
+        const snapshot = buildRiskSnapshot(data);
+        const strategyResult = await analyzeWithStrategyServer(data, 'XAU/USD');
+        const message = formatSignalMessage({
+            symbol: 'XAU/USD',
+            timeframe: TIMEFRAME_LABEL,
+            strategyResult,
+            snapshot
+        });
 
-// Check if running on Render or locally
-if (process.env.RENDER_EXTERNAL_URL) {
-  // Running on Render - use webhook
-  const app = express();
-  const port = process.env.PORT || 3000;
-
-  // Health check route for Render
-  app.get('/', (req, res) => {
-    res.send('SMC + AI Confluence Sniper Bot is running!');
-  });
-
-  // Set up webhook for Telegram
-  app.use(bot.webhookCallback(`/bot${process.env.BOT_TOKEN}`));
-
-  app.listen(port, () => {
-    console.log(`SMC + AI Confluence Sniper Bot listening on port ${port}...`);
-    // Set webhook URL when deployed on Render
-    let renderUrl = process.env.RENDER_EXTERNAL_URL;
-    console.log("RENDER_EXTERNAL_URL:", process.env.RENDER_EXTERNAL_URL);
-
-    if (renderUrl) {
-      if (renderUrl.startsWith('https://')) {
-        renderUrl = renderUrl.substring(8);
-      } else if (renderUrl.startsWith('http://')) {
-        renderUrl = renderUrl.substring(7);
-      }
-      renderUrl = `https://${renderUrl}`;
-    } else {
-      console.error("RENDER_EXTERNAL_URL is not set!");
-      return;
+        await ctx.reply(message);
+    } catch (error) {
+        console.error('Error in status command:', error.message);
+        await ctx.reply('? Error retrieving market status.');
     }
+});
 
-    const webhookUrl = `${renderUrl}/bot${process.env.BOT_TOKEN}`;
-    console.log("Setting webhook to:", webhookUrl);
+// Start the bot
+bot.launch();
 
-    bot.telegram.setWebhook(webhookUrl);
-  });
-} else {
-  // Running locally - use polling
-  bot.launch();
-  console.log('SMC + AI Confluence Sniper Bot started in polling mode...');
-}
+// Start the market analysis loop
+startMarketAnalysis();
 
+// Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+console.log(`XAU/USD Trading Bot is running on ${TIMEFRAME_LABEL} data...`);
+
+
