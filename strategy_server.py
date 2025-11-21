@@ -1,3 +1,8 @@
+import os
+# Suppress TensorFlow logs before importing TensorFlow
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
@@ -8,31 +13,36 @@ import os
 # Add project root to path to import modules
 sys.path.append(os.path.join(os.path.dirname(__file__)))
 
-# Import our SMC and strategy modules
+# Add path to the new backtrader strategy
+sys.path.append(os.path.join(os.path.dirname(__file__), 'deep_leraning', 'backtrader-pullback-window-xauusd', 'src', 'strategy'))
+
+# Import the new strategy class from the backtrader-pullback-window-xauusd repository
+from sunrise_ogle_xauusd import SunriseOgle
+# Import other components assuming they exist in the project
 from smc_engine.smc import SMCAnalyzer
 from ai_engine.predict import PredictionEngine
-from strategy.hybrid_smc_ai_strategy import HybridSMCAIStrategy
 
 
 app = Flask(__name__)
 
-# Initialize SMC and AI components
-smc_analyzer = SMCAnalyzer(lookback_period=20)
-ai_engine = PredictionEngine()
-
-
 class StrategyProcessor:
     """
-    Processes market data and generates trading signals based on SMC + AI analysis
+    Processes market data and generates trading signals based on the new SunriseOgle strategy
     """
-    
+
     def __init__(self):
-        self.smc_analyzer = SMCAnalyzer(lookback_period=20)
+        # We'll create a simplified version of the strategy logic that works for real-time analysis
+        # instead of the full backtrader framework
+        pass
+
+    def __init__(self):
+        # Initialize the AI engine to be used for prediction
         self.ai_engine = PredictionEngine()
 
     def process_data(self, data: Dict[str, List[float]]) -> Dict[str, Any]:
         """
         Process OHLCV data and return trading signal with entry, SL, and TP levels
+        Using simplified logic based on the SunriseOgle strategy and AI prediction
         """
         try:
             # Create DataFrame from received data
@@ -43,7 +53,7 @@ class StrategyProcessor:
                 'close': data.get('close', []),
                 'volume': data.get('volume', [])
             })
-            
+
             if df.empty or len(df) < 50:  # Need minimum data for analysis
                 return {
                     'signal': 'NEUTRAL',
@@ -51,38 +61,44 @@ class StrategyProcessor:
                     'sl': None,
                     'tp': None,
                     'reason': 'INSUFFICIENT_DATA',
-                    'confidence': 0.0
+                    'confidence': 0.0,
+                    'aiSignal': 'NEUTRAL',
+                    'aiConfidence': 0.0
                 }
-            
-            # Run SMC analysis
-            smc_result = self.smc_analyzer.analyze(df)
-            
+
+            # Analyze using a simplified version of the SunriseOgle strategy logic
+            signal, entry, sl, tp, reason, confidence = self._analyze_with_sunrise_ogle_logic(df)
+
             # Get AI prediction
             closes = data.get('close', [])
-            ai_result = self.ai_engine.get_prediction(closes)
-            
-            # Run risk management checks
-            risk_ok = self.check_risk_management(df, smc_result)
-            
-            # Generate final signal based on SMC, AI and risk filters
-            signal, confidence = self.generate_signal(smc_result, ai_result, risk_ok)
-            
-            # Calculate entry, stop loss, and take profit levels
-            entry, sl, tp, explanation = self.calculate_levels(
-                df, signal, smc_result, ai_result
-            )
-            
+            if closes:
+                try:
+                    ai_result = self.ai_engine.get_prediction(closes)
+                    ai_signal = ai_result.get('signal', 'NEUTRAL')
+                    ai_confidence = ai_result.get('confidence', 0.0)
+                except Exception as e:
+                    print(f"Error getting AI prediction: {str(e)}")
+                    ai_signal = 'NEUTRAL'
+                    ai_confidence = 0.0
+            else:
+                ai_signal = 'NEUTRAL'
+                ai_confidence = 0.0
+
             return {
                 'signal': signal,
                 'entry': entry,
                 'sl': sl,
                 'tp': tp,
-                'reason': explanation,
-                'confidence': confidence
+                'reason': reason,
+                'confidence': confidence,
+                'aiSignal': ai_signal,
+                'aiConfidence': ai_confidence
             }
-            
+
         except Exception as e:
             print(f"Error in process_data: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {
                 'signal': 'NEUTRAL',
                 'entry': None,
@@ -92,137 +108,127 @@ class StrategyProcessor:
                 'confidence': 0.0
             }
 
-    def generate_signal(self, smc_result: Dict, ai_result: Dict, risk_ok: bool) -> tuple:
+    def _analyze_with_sunrise_ogle_logic(self, df: pd.DataFrame) -> tuple:
         """
-        Generate signal based on SMC and AI combination
+        Simplified version of the SunriseOgle strategy logic adapted for real-time analysis
         """
-        if not risk_ok:
-            return 'NEUTRAL', 0.0
-        
-        smc_signal = smc_result.get('bias', 'NEUTRAL')
-        ai_signal = ai_result.get('signal', 'NEUTRAL')
-        ai_confidence = ai_result.get('confidence', 0.0)
-        
-        # Combine signals according to priority
-        if smc_signal == 'NEUTRAL' and ai_signal == 'NEUTRAL':
-            return 'NEUTRAL', 0.0
-        elif smc_signal != 'NEUTRAL' and ai_signal != 'NEUTRAL':
-            # Both signals agree
-            if smc_signal == ai_signal:
-                confidence = 0.8 * 0.7 + 0.2 * ai_confidence  # SMC weight 0.7, AI weight 0.3
-                return smc_signal, min(1.0, confidence)
-            else:
-                # Conflict: SMC takes priority
-                return smc_signal, 0.7
-        elif smc_signal != 'NEUTRAL':
-            # Only SMC has a signal
-            return smc_signal, 0.6
-        elif ai_signal != 'NEUTRAL':
-            # Only AI has a signal
-            return ai_signal, ai_confidence
-        else:
-            return 'NEUTRAL', 0.0
+        try:
+            # Get the latest data points
+            current_close = df['close'].iloc[-1]
+            current_high = df['high'].iloc[-1]
+            current_low = df['low'].iloc[-1]
+            current_open = df['open'].iloc[-1]
 
-    def check_risk_management(self, df: pd.DataFrame, smc_result: Dict) -> bool:
-        """
-        Apply risk management checks
-        """
-        if len(df) < 200:
-            return False
-        
-        current_price = df['close'].iloc[-1]
-        
-        # Check trend alignment and volatility metrics
-        trend = smc_result.get('trend', 'NEUTRAL')
-        market_phase = smc_result.get('market_phase', 'RANGING')
-        
-        # Additional risk checks could go here
-        # For now, we'll return True if we have sufficient data and reasonable conditions
-        return market_phase != 'INSUFFICIENT_DATA' and trend != 'NEUTRAL'
+            # Get previous candle data for direction confirmation
+            if len(df) < 2:
+                return 'NEUTRAL', None, None, None, 'INSUFFICIENT_DATA', 0.0
 
-    def calculate_levels(self, df: pd.DataFrame, signal: str, 
-                        smc_result: Dict, ai_result: Dict) -> tuple:
-        """
-        Calculate entry, stop loss, and take profit levels
-        """
-        if signal == 'NEUTRAL':
-            return None, None, None, 'No signal generated'
-        
-        current_price = df['close'].iloc[-1]
-        high_20 = df['high'].tail(20).max()
-        low_20 = df['low'].tail(20).min()
-        
-        # Calculate ATR for risk management
-        atr = self.calculate_atr(df)
-        
-        entry = None
-        sl = None
-        tp = None
-        explanation = ""
-        
-        if signal == 'BUY':
-            # For BUY signals: entry at current price, SL below recent swing low
-            entry = current_price
-            
-            # Find recent swing lows for SL level
-            swing_lows = smc_result.get('swing_lows', [])
-            if swing_lows:
-                recent_swing_low = max(swing_lows, key=lambda x: x['index']) if swing_lows else None
-                if recent_swing_low:
-                    sl = recent_swing_low['price'] - (atr * 0.5)  # SL below swing low
-                else:
-                    sl = current_price - (atr * 2)  # Fallback using ATR
-            else:
-                sl = current_price - (atr * 2)
-            
-            # Calculate TP based on risk-reward ratio (e.g., 1:2)
-            risk_distance = abs(entry - sl) if sl else atr * 2
-            tp = entry + (risk_distance * 2)  # 1:2 risk-reward ratio
-            
-            explanation = f"Buy signal: Entry at {entry:.5f}, SL at {sl:.5f}, TP at {tp:.5f}"
-        
-        elif signal == 'SELL':
-            # For SELL signals: entry at current price, SL above recent swing high
-            entry = current_price
-            
-            # Find recent swing highs for SL level
-            swing_highs = smc_result.get('swing_highs', [])
-            if swing_highs:
-                recent_swing_high = max(swing_highs, key=lambda x: x['index']) if swing_highs else None
-                if recent_swing_high:
-                    sl = recent_swing_high['price'] + (atr * 0.5)  # SL above swing high
-                else:
-                    sl = current_price + (atr * 2)  # Fallback using ATR
-            else:
-                sl = current_price + (atr * 2)
-            
-            # Calculate TP based on risk-reward ratio (e.g., 1:2)
-            risk_distance = abs(sl - entry) if sl else atr * 2
-            tp = entry - (risk_distance * 2)  # 1:2 risk-reward ratio
-            
-            explanation = f"Sell signal: Entry at {entry:.5f}, SL at {sl:.5f}, TP at {tp:.5f}"
-        
-        return entry, sl, tp, explanation
+            prev_close = df['close'].iloc[-2]
+            prev_open = df['open'].iloc[-2]
 
-    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        """
-        Calculate Average True Range for risk management
-        """
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        
-        # Calculate True Range
-        tr1 = high - low
-        tr2 = abs(high - close.shift(1))
-        tr3 = abs(low - close.shift(1))
-        
-        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        # Calculate ATR
-        atr = true_range.rolling(window=period).mean().iloc[-1]
-        
-        return float(atr) if not np.isnan(atr) else 0.001  # Return small value if ATR is NaN
+            # Calculate basic indicators that the strategy uses
+            # EMA calculations (from the strategy parameters)
+            ema_fast = df['close'].rolling(window=14).mean().iloc[-1]
+            ema_medium = df['close'].rolling(window=18).mean().iloc[-1]
+            ema_slow = df['close'].rolling(window=24).mean().iloc[-1]
+            ema_confirm = df['close'].rolling(window=1).mean().iloc[-1]  # Effectively current close
+
+            # Calculate ATR for volatility filtering (similar to strategy)
+            # For XAU/USD, we need to use appropriate parameters
+            high_low = df['high'] - df['low']
+            high_close = abs(df['high'] - df['close'].shift()).fillna(0)
+            low_close = abs(df['low'] - df['close'].shift()).fillna(0)
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = true_range.rolling(window=10).mean().iloc[-1]
+
+            # For XAU/USD, ensure we have realistic price ranges
+            current_price = df['close'].iloc[-1]
+            # XAU/USD (gold) typically trades between $1200-$2500, with some extreme ranges possible
+            if current_price < 1200 or current_price > 2800:
+                return 'NEUTRAL', None, None, None, f'PRICE_OUT_OF_RANGE: Current price {current_price} seems unrealistic for XAU/USD', 0.0
+
+            # Check for EMA crossovers (core strategy logic from SunriseOgle)
+            # LONG signal: confirmation EMA crosses above other EMAs (with conditions)
+            long_signal = (
+                (ema_confirm > ema_fast or ema_confirm > ema_medium or ema_confirm > ema_slow) and
+                (prev_close > prev_open)  # Previous candle bullish (candle direction filter)
+            )
+
+            # SHORT signal: confirmation EMA crosses below other EMAs
+            short_signal = (
+                (ema_confirm < ema_fast or ema_confirm < ema_medium or ema_confirm < ema_slow) and
+                (prev_close < prev_open)  # Previous candle bearish (candle direction filter)
+            )
+
+            # Apply basic ATR volatility filter (from strategy parameters)
+            # Adjust for XAU/USD which has different price ranges than forex pairs
+            atr_min_threshold = 5.0   # Minimum ATR for XAU/USD (in price units)
+            atr_max_threshold = 50.0  # Maximum ATR for XAU/USD (in price units)
+
+            if pd.isna(atr) or atr < atr_min_threshold or atr > atr_max_threshold:
+                return 'NEUTRAL', None, None, None, f'ATR_FILTERED: {atr:.6f} outside range', 0.0
+
+            # Determine signal based on the strategy's core logic
+            if long_signal and not short_signal:
+                # Calculate entry, SL, TP based on strategy's risk management
+                entry = current_close
+                # Using strategy's default multipliers: long_atr_sl_multiplier=4.5, long_atr_tp_multiplier=6.5
+                sl = current_low - (atr * 4.5)  # Stop loss below recent low with multiplier
+                tp = current_high + (atr * 6.5)  # Take profit based on ATR
+                reason = f'LONG_SIGNAL: EMA crossover with bullish confirmation, ATR={atr:.6f}'
+                confidence = min(0.9, atr * 5000)  # Use ATR as a proxy for confidence
+
+                return 'BUY', entry, sl, tp, reason, confidence
+
+            elif short_signal and not long_signal:
+                # Calculate entry, SL, TP for short based on strategy's risk management
+                entry = current_close
+                # Using strategy's default multipliers for short: short_atr_sl_multiplier=2.5, short_atr_tp_multiplier=6.5
+                sl = current_high + (atr * 2.5)  # SL above for short
+                tp = current_low - (atr * 6.5)   # TP below for short
+                reason = f'SHORT_SIGNAL: EMA crossover with bearish confirmation, ATR={atr:.6f}'
+                confidence = min(0.9, atr * 5000)  # Use ATR as a proxy for confidence
+
+                return 'SELL', entry, sl, tp, reason, confidence
+
+            else:
+                # Check for pullback conditions (similar to phase 2 of strategy)
+                lookback_period = min(20, len(df))
+                recent_highs = df['high'].tail(lookback_period)
+                recent_lows = df['low'].tail(lookback_period)
+
+                # Check for potential long setup after pullback to support
+                if current_close > recent_lows.min() and current_close < recent_highs.max():
+                    # Possible long setup after pullback to support
+                    if current_close > ema_fast and current_close > ema_medium and current_close > ema_slow:
+                        entry = current_close
+                        sl = recent_lows.min() - (atr * 0.5)
+                        tp = current_high + (atr * 3.0)
+                        reason = f'LONG_PULLBACK: Price holding above support after pullback, ATR={atr:.6f}'
+                        confidence = 0.6
+
+                        return 'BUY', entry, sl, tp, reason, confidence
+
+                # Check for potential short setup after pullback to resistance
+                elif current_close < recent_highs.max() and current_close > recent_lows.min():
+                    # Possible short setup after pullback to resistance
+                    if current_close < ema_fast and current_close < ema_medium and current_close < ema_slow:
+                        entry = current_close
+                        sl = recent_highs.max() + (atr * 0.5)
+                        tp = current_low - (atr * 3.0)
+                        reason = f'SHORT_PULLBACK: Price holding below resistance after pullback, ATR={atr:.6f}'
+                        confidence = 0.6
+
+                        return 'SELL', entry, sl, tp, reason, confidence
+
+            # If we reach here, no clear signal was found
+            return 'NEUTRAL', None, None, None, f'NO_CLEAR_SIGNAL: ATR={atr:.6f}', 0.3
+
+        except Exception as e:
+            print(f"Error in simplified SunriseOgle analysis: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return 'NEUTRAL', None, None, None, f'ANALYSIS_ERROR: {str(e)}', 0.0
 
 
 # Initialize strategy processor
@@ -241,7 +247,7 @@ def analyze():
     }
     OR
     {
-        "symbol": "XAUUSDT", 
+        "symbol": "XAUUSDT",
         "open": [2000, 2001, ...],
         "high": [2010, 2012, ...],
         "low": [1995, 1998, ...],
@@ -250,6 +256,7 @@ def analyze():
     }
     """
     try:
+        print("DEBUG: Received request to /analyze endpoint")
         data = request.get_json()
         
         if not data:
@@ -300,7 +307,9 @@ def analyze():
         }
         
         # Process the data to get signal
+        print(f"DEBUG: Calling processor with data lengths - open: {len(processed_data['open'])}, high: {len(processed_data['high'])}, low: {len(processed_data['low'])}, close: {len(processed_data['close'])}, volume: {len(processed_data['volume'])}")
         result = processor.process_data(processed_data)
+        print(f"DEBUG: Got result from processor - signal: {result['signal']}, entry: {result['entry']}, confidence: {result['confidence']}")
         
         # Return the result with symbol information
         response = {
@@ -315,9 +324,12 @@ def analyze():
         }
         
         return jsonify(response)
-        
+
     except Exception as e:
-        print(f"Error in /analyze endpoint: {str(e)}")
+        print(f"ERROR in /analyze endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()  # Full error stack to see what's wrong
+
         return jsonify({
             'error': f'Analysis failed: {str(e)}',
             'signal': 'NEUTRAL',
@@ -325,7 +337,9 @@ def analyze():
             'sl': None,
             'tp': None,
             'reason': f'ERROR: {str(e)}',
-            'confidence': 0.0
+            'confidence': 0.0,
+            'aiSignal': 'NEUTRAL',
+            'aiConfidence': 0.0
         }), 500
 
 

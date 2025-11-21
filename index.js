@@ -1,9 +1,12 @@
 ﻿require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const ccxt = require('ccxt');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const STRATEGY_SERVER_URL = 'http://localhost:5000/analyze';
+const STRATEGY_SERVER_URL = process.env.STRATEGY_SERVER_URL || 'http://localhost:5000/analyze';
+const AI_SERVER_URL = process.env.AI_SERVER_URL || 'http://127.0.0.1:8000/predict';
+const AI_TIMEOUT_MS = parseInt(process.env.AI_TIMEOUT_MS || '5000', 10);
 const TIMEFRAME = '15min';
 const TIMEFRAME_LABEL = '15min (15 daqiqa)';
 const MAX_RISK_ALLOWED = 40;
@@ -12,35 +15,52 @@ const ALERT_COOLDOWN = 300000; // 5 minutes
 let lastCandleTime = 0;
 let lastAlert = 0;
 
-// Function to fetch OHLC data from TwelveData (supports XAU/USD)
+// Enhanced TwelveData API request with detailed logging
 async function fetchOHLCV(symbol = 'XAU/USD', timeframe = TIMEFRAME, limit = 100) {
     try {
-        const response = await axios.get('https://api.twelvedata.com/time_series', {
-            params: {
-                symbol,
-                interval: timeframe,
-                outputsize: limit,
-                apikey: process.env.TWELVEDATA_KEY
+        if (!process.env.TWELVEDATA_KEY) {
+            throw new Error('TWELVEDATA_KEY environment variable is not set');
+        }
+
+        try {
+            let apiSymbol = symbol;
+            if (symbol === 'XAU/USD') {
+                apiSymbol = 'XAU'; // Try alternative symbol for TwelveData
             }
-        });
 
-        if (!response.data || response.data.status === 'error') {
-            throw new Error(response.data?.message || 'Failed to fetch data from TwelveData');
+            const response = await axios.get('https://api.twelvedata.com/time_series', {
+                params: {
+                    symbol: apiSymbol,
+                    interval: timeframe,
+                    outputsize: limit,
+                    apikey: process.env.TWELVEDATA_KEY
+                }
+            });
+
+            console.log('TwelveData API response:', response.data);
+
+            if (!response.data || response.data.status === 'error') {
+                throw new Error(response.data?.message || 'TwelveData API returned an error');
+            }
+
+            const values = Array.isArray(response.data.values) ? response.data.values.slice().reverse() : [];
+            if (values.length === 0) {
+                throw new Error('TwelveData API returned no data values');
+            }
+
+            console.log('Using TwelveData API for XAU/USD');
+            return {
+                open: values.map(item => parseFloat(item.open)),
+                high: values.map(item => parseFloat(item.high)),
+                low: values.map(item => parseFloat(item.low)),
+                close: values.map(item => parseFloat(item.close)),
+                volume: values.map(item => parseFloat(item.volume || 0)),
+                timestamps: values.map(item => new Date(item.datetime).getTime())
+            };
+        } catch (error) {
+            console.error('Error with TwelveData API:', error.message);
+            throw new Error(`TwelveData API error: ${error.message}`);
         }
-
-        const values = Array.isArray(response.data.values) ? response.data.values.slice().reverse() : [];
-        if (values.length === 0) {
-            throw new Error('Empty response from TwelveData');
-        }
-
-        return {
-            open: values.map(item => parseFloat(item.open)),
-            high: values.map(item => parseFloat(item.high)),
-            low: values.map(item => parseFloat(item.low)),
-            close: values.map(item => parseFloat(item.close)),
-            volume: values.map(item => parseFloat(item.volume || 0)),
-            timestamps: values.map(item => new Date(item.datetime).getTime())
-        };
     } catch (error) {
         console.error('Error fetching OHLCV data:', error.message);
         throw error;
@@ -123,6 +143,12 @@ function buildRiskSnapshot(data) {
     if (closes.length < 210) throw new Error('Not enough data for risk snapshot');
 
     const price = closes[closes.length - 1];
+
+    // Validate XAU/USD price range to prevent unrealistic values
+    // XAU/USD (gold) typically trades between $1800-$2200, with some extreme ranges possible
+    if (price < 1200 || price > 2800) {
+        throw new Error(`XAU/USD price ${price} is outside realistic range (1200-2800)`);
+    }
     const ema200 = calculateEMA(closes, 200);
     const ema50 = calculateEMA(closes, 50);
     const rsi14 = calculateRSI(closes, 14);
@@ -185,8 +211,38 @@ function buildRiskSnapshot(data) {
 function determineFinalSignal(strategySignal, aiSignal) {
     const strat = (strategySignal || 'NEUTRAL').toUpperCase();
     const ai = (aiSignal || 'NEUTRAL').toUpperCase();
-    if (ai === 'NEUTRAL' || strat === ai) return strat;
+
+    // If both signals agree, return the agreed signal
+    if (strat === ai && strat !== 'NEUTRAL') return strat;
+
+    // If strategy is neutral but AI has a strong signal, use AI
+    if (strat === 'NEUTRAL' && ai !== 'NEUTRAL') return ai;
+
+    // Otherwise, prioritize strategy signal but consider AI as supporting factor
     return strat;
+}
+
+async function fetchAISignal(closes) {
+    if (!AI_SERVER_URL) {
+        return { signal: 'NEUTRAL', confidence: 0, raw: 0 };
+    }
+
+    try {
+        const response = await axios.post(
+            AI_SERVER_URL,
+            { closes },
+            { timeout: AI_TIMEOUT_MS }
+        );
+        const { signal = 'NEUTRAL', confidence = 0, raw_prediction: raw = 0 } = response.data || {};
+        return {
+            signal: typeof signal === 'string' ? signal.toUpperCase() : 'NEUTRAL',
+            confidence: Number(confidence) || 0,
+            raw: Number(raw) || 0
+        };
+    } catch (error) {
+        console.error('AI server request failed:', error.message);
+        return { signal: 'NEUTRAL', confidence: 0, raw: 0, error: error.message };
+    }
 }
 
 // Function to analyze market with the new strategy server
@@ -229,6 +285,14 @@ async function analyzeMarket() {
 
         // Fetch latest OHLCV data for XAU/USD
         const data = await fetchOHLCV('XAU/USD', TIMEFRAME, 320); // 15-minute timeframe
+
+        // Validate that we have realistic data before proceeding
+        const latestClose = data.close[data.close.length - 1];
+        if (latestClose < 1200 || latestClose > 2800) {
+            console.log(`⚠️ WARNING: Received unrealistic XAU/USD price: ${latestClose}. This may indicate an issue with the data source.`);
+            return; // Skip processing if we have unrealistic data
+        }
+
         const snapshot = buildRiskSnapshot(data);
 
         // Get the latest candle time
@@ -245,13 +309,18 @@ async function analyzeMarket() {
 
         // Analyze with the new strategy server
         const strategyResult = await analyzeWithStrategyServer(data, 'XAU/USD');
+        const aiInsight = await fetchAISignal(data.close);
+        strategyResult.aiSignal = aiInsight.signal;
+        strategyResult.aiConfidence = aiInsight.confidence;
+        strategyResult.aiRaw = aiInsight.raw;
         console.log('Strategy Analysis:', strategyResult);
+        console.log('AI Insight:', aiInsight);
 
         const normalizedSignal = (strategyResult.signal || 'NEUTRAL').toUpperCase();
 
         if (strategyResult && normalizedSignal !== 'NEUTRAL') {
             // Check if signal confidence is high enough
-            if (strategyResult.confidence >= 0.6) { // At least 60% confidence
+            if (strategyResult.confidence >= 0.3) { // Lowered to 30% to allow more signals
                 // Check if enough time has passed since last alert
                 if (Date.now() - lastAlert > ALERT_COOLDOWN) {
                     // Send alert to all users
@@ -274,13 +343,15 @@ async function analyzeMarket() {
                     console.log('Alert cooldown active, skipping...');
                 }
             } else {
-                console.log(`Signal confidence too low: ${(strategyResult.confidence * 100).toFixed(1)}%. Required: >=60%.`);
+                console.log(`Signal confidence too low: ${(strategyResult.confidence * 100).toFixed(1)}%. Required: >=30%.`);
             }
         } else {
             console.log('No valid signal generated from strategy server');
         }
     } catch (error) {
         console.error('Error in analyzeMarket:', error.message);
+        // Note: This is for console logging only, not for user-facing commands
+        // The user-facing commands have their own error handling in /status and /analyze
     }
 }
 
@@ -365,18 +436,55 @@ Signals include Entry, Stop Loss, and Take Profit levels.`);
 
 bot.command('analyze', async (ctx) => {
     try {
-        await ctx.reply('🔄 Running manual market analysis for XAU/USD...');
-        await analyzeMarket();
-        await ctx.reply('✅ Analysis completed. Check console for results.');
+        await ctx.reply("🔄 XAU/USD uchun qo'ls'k cho'zish tahlili boshlanmoqda...");
+        const data = await fetchOHLCV('XAU/USD', TIMEFRAME, 320);
+
+        // Validate that we have realistic data before proceeding for analyze command too
+        const latestClose = data.close[data.close.length - 1];
+        if (latestClose < 1200 || latestClose > 2800) {
+            await ctx.reply(`⚠️ XAU/USD narxi realistik bo'lmagan qiymat: ${latestClose}. Iltimos, tarif reytingingizni tekshiring. TwelveData API XAU/USD ma'lumotlarini cheklangan tariflarda berolmaydi.`);
+            return;
+        }
+
+        // Continue with analysis using the validated data
+        const snapshot = buildRiskSnapshot(data);
+        const strategyResult = await analyzeWithStrategyServer(data, 'XAU/USD');
+        const aiInsight = await fetchAISignal(data.close);
+        strategyResult.aiSignal = aiInsight.signal;
+        strategyResult.aiConfidence = aiInsight.confidence;
+        strategyResult.aiRaw = aiInsight.raw;
+
+        const message = formatSignalMessage({
+            symbol: 'XAU/USD',
+            timeframe: TIMEFRAME_LABEL,
+            strategyResult,
+            snapshot
+        });
+
+        await ctx.reply(message);
+        console.log('Manual Analysis:', strategyResult);
+        console.log('AI Insight:', aiInsight);
     } catch (error) {
         console.error('Error in manual analysis:', error.message);
-        await ctx.reply('❌ Error during analysis. Check logs.');
+        if (error.message.includes('This symbol is available starting with Grow')) {
+            await ctx.reply('⚠️ XAU/USD ma\'lumotlarini olish uchun TwelveData Grow yoki undan yuqori tarif kerak. Sizning joriy tarifingiz XAU/USD ma\'lumotlarini olish huquqini berlmay.');
+        } else {
+            await ctx.reply('❌ Tahlilda xatolik yuz berdi: ' + error.message);
+        }
     }
 });
 
 bot.command('status', async (ctx) => {
     try {
         const data = await fetchOHLCV('XAU/USD', TIMEFRAME, 320);
+
+        // Validate that we have realistic data before proceeding for status command too
+        const latestClose = data.close[data.close.length - 1];
+        if (latestClose < 1200 || latestClose > 2800) {
+            await ctx.reply(`⚠️ XAU/USD narxi realistik bo'lmagan qiymat: ${latestClose}. Iltimos, tarif reytingingizni tekshiring. TwelveData API XAU/USD ma'lumotlarini cheklangan tariflarda berolmaydi.`);
+            return;
+        }
+
         const snapshot = buildRiskSnapshot(data);
         const strategyResult = await analyzeWithStrategyServer(data, 'XAU/USD');
         const message = formatSignalMessage({
@@ -389,7 +497,11 @@ bot.command('status', async (ctx) => {
         await ctx.reply(message);
     } catch (error) {
         console.error('Error in status command:', error.message);
-        await ctx.reply('? Error retrieving market status.');
+        if (error.message.includes('This symbol is available starting with Grow')) {
+            await ctx.reply('⚠️ XAU/USD ma\'lumotlarini olish uchun TwelveData Grow yoki undan yuqori tarif kerak. Sizning joriy tarifingiz XAU/USD ma\'lumotlarini olish huquqini berlmay.');
+        } else {
+            await ctx.reply('? XAU/USD holatini olishda xatolik yuz berdi: ' + error.message);
+        }
     }
 });
 
@@ -404,5 +516,3 @@ process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
 console.log(`XAU/USD Trading Bot is running on ${TIMEFRAME_LABEL} data...`);
-
-

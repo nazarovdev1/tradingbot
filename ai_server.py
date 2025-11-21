@@ -1,4 +1,8 @@
 import os
+# Suppress TensorFlow logs before importing TensorFlow
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 from pathlib import Path
 from typing import List
 
@@ -41,9 +45,11 @@ class PredictResponse(BaseModel):
 
 
 def map_signal(prediction: float) -> str:
-    if prediction > 0.6:
+    # More practical thresholds for trading signals
+    # Using smaller thresholds to catch more trading opportunities
+    if prediction > 0.1:
         return 'BUY'
-    if prediction < -0.6:
+    if prediction < -0.1:
         return 'SELL'
     return 'NEUTRAL'
 
@@ -78,4 +84,4 @@ async def health():
 if __name__ == '__main__':
     import uvicorn
 
-    uvicorn.run('ai_server:app', host='0.0.0.0', port=int(os.getenv('AI_SERVER_PORT', 8000)), reload=False)
+    uvicorn.run('ai_server:app', host='0.0.0.0', port=int(os.getenv('AI_SERVER_PORT', 5001)), reload=False)
