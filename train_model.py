@@ -1,4 +1,6 @@
 import yfinance as yf
+import pandas as pd
+import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -14,9 +16,44 @@ def create_model():
     return model
 
 def main():
-    print("Downloading XAU/USD data...")
-    data = yf.download("GC=F", start="2019-01-01", end="2025-01-01")  # Using GC=F for Gold futures
-    closes = data['Close'].dropna().values
+    # Check if local CSV exists
+    csv_path = 'models/XAU_15m_data.csv'
+    if os.path.exists(csv_path):
+        print(f"Loading data from {csv_path}...")
+        
+        # Try reading with header first to check format
+        # But based on user feedback, it seems to lack headers or have different format
+        # Let's try reading it assuming no header if the first attempt fails or check first line
+        
+        try:
+            # Read first line to check delimiter and header
+            with open(csv_path, 'r') as f:
+                first_line = f.readline()
+            
+            if ';' in first_line:
+                # Previous format with semi-colon
+                df = pd.read_csv(csv_path, sep=';')
+            else:
+                # New format: Comma separated, likely no header based on file view
+                # 2021-09-01 07:30,1812.648,1813.658,1811.378,1812.925,15
+                # Columns: Date, Open, High, Low, Close, Volume (maybe)
+                df = pd.read_csv(csv_path, header=None, names=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        
+        except Exception as e:
+            print(f"Error reading CSV: {e}")
+            return
+
+        # Ensure 'Close' column exists
+        if 'Close' in df.columns:
+            closes = df['Close'].values
+            print(f"Loaded {len(closes)} candles from CSV.")
+        else:
+            print("Error: 'Close' column not found in CSV")
+            return
+    else:
+        print("CSV file not found. Downloading XAU/USD data from Yahoo Finance...")
+        data = yf.download("GC=F", start="2019-01-01", end="2025-01-01")  # Using GC=F for Gold futures
+        closes = data['Close'].dropna().values
 
     if len(closes) < 100:
         print("Not enough data")

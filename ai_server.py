@@ -57,22 +57,33 @@ def map_signal(prediction: float) -> str:
 @app.post('/predict', response_model=PredictResponse)
 async def predict(payload: PredictPayload):
     if model is None:
-        # Fallback mode: return NEUTRAL with random prediction
         prediction = np.random.normal(0, 0.5)
     else:
         try:
+            print("Received Data:", payload.closes)  # Log received data
             closes = np.asarray(payload.closes, dtype=np.float32)
             if payload.normalize:
                 closes, _, _ = normalize_series(closes)
-            else:
-                closes = closes.astype(np.float32)
+                print("Normalized Data:", closes)  # Log normalized data
             reshaped = reshape_for_lstm(closes)
             prediction = float(model.predict(reshaped, verbose=0).squeeze())
-        except Exception as exc:  # pylint: disable=broad-except
+            print("Raw Model Prediction:", prediction)  # Log raw prediction
+        except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to run inference: {exc}") from exc
 
     signal = map_signal(prediction)
     confidence = float(min(1.0, abs(prediction)))
+
+    # Minimal confidence threshold
+    if confidence < 0.5:
+        signal = 'NEUTRAL'
+        decision_reason = "Below threshold, set to NEUTRAL"
+        confidence = 0.5  # Set minimum confidence
+    else:
+        decision_reason = "Confidence above threshold"
+
+    print(f"AI Insight: Raw Prediction: {prediction}, Confidence: {confidence}, Decision: {signal}, Reason: {decision_reason}")
+
     return PredictResponse(signal=signal, confidence=confidence, raw_prediction=prediction)
 
 
